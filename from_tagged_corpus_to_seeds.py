@@ -5,8 +5,8 @@ import re
 from collections import defaultdict
 
 lemma_file="manchester_input_tagged_trf_word_and_lemma.txt"
-output="manchester_input_tagged_trf_word_and_lemma_postprocessed.txt"
-with open(output, 'w') as fi:
+output_filename="manchester_input_tagged_trf_word_and_lemma_postprocessed.txt"
+with open(output_filename, 'w') as fi:
     with open(lemma_file, 'r') as infile:
         lines = infile.readlines()
         i = 0
@@ -48,9 +48,7 @@ with open(output, 'w') as fi:
             line = re.sub("(pretend)_NOUN","\\1_X",line)
             line = re.sub("(-)_NOUN","\\1_X",line)
             line = re.sub("(upsidedown)_NOUN","\\1_X",line)
-            output += line
-            output = output + "\n"
-        fi.write(output)
+            fi.write(line + "\n")
 
 
 noun_tokens=defaultdict(int)
@@ -100,17 +98,29 @@ en=wn.Wordnet('omw-en:1.4')
 from nltk.corpus import wordnet as nltk_wn
 
 from collections import defaultdict
-d= defaultdict(int)
+
+# Verb inclusion is now based on human judgments in verb_inclusion.xlsx rather
+# than WordNet. A verb is included (1) if its lemma appears in the "lemma"
+# column with INCLUDE_human == 1; any lemma not present in the sheet, or
+# present with INCLUDE_human != 1, is excluded (0).
+verb_inclusion_df = pd.read_excel("verb_inclusion.xlsx")
+human_include_lookup = dict(zip(verb_inclusion_df["lemma"].astype(str), verb_inclusion_df["INCLUDE_human"]))
+
+# Sanity check: every lemma in verb_inclusion.xlsx should actually occur among
+# the verbs extracted from the corpus. A lemma that doesn't match anything is
+# most likely a typo or a stale entry from a previous corpus/tagset.
+corpus_verb_set = set(verbs["Word"].astype(str))
+missing_lemmas = sorted(set(human_include_lookup) - corpus_verb_set)
+if missing_lemmas:
+    raise ValueError(
+        f"{len(missing_lemmas)} lemma(s) in verb_inclusion.xlsx do not occur in the "
+        f"corpus verb list: {missing_lemmas}"
+    )
+
+d = defaultdict(int)
 for i in range(verbs.shape[0]):
-    lemma=str(verbs.iloc[i,0])
-    syn_nltk=nltk_wn.synsets(lemma,pos='v')
-    classes=[]
-    for i in range(len(syn_nltk)):
-        classes.append(syn_nltk[i].lexname())
-    if len(set(classes).intersection(["verb.motion","verb.body","verb.consumption","verb.competition","verb.communication"])) > 0:
-          d[lemma] = 1
-    else:
-          d[lemma] = 0
+    lemma = str(verbs.iloc[i, 0])
+    d[lemma] = 1 if human_include_lookup.get(lemma) == 1 else 0
 
 verbs=verbs.merge(pd.DataFrame(d.items(),columns=["Word","Include"]),left_on='Word',right_on='Word')
 

@@ -14,6 +14,7 @@
 #   $OUT_DIR/summary_parts/*.csv
 #   $OUT_DIR/confusion_parts/*.txt
 #   $OUT_DIR/confusion_words_*.csv
+#   $OUT_DIR/pattern_usage_*.csv
 # instead of appending to a shared file, so running many jobs in parallel
 # never risks corrupting a file through concurrent writes. Once all jobs
 # finish, this script calls `category_bootstrap.py --merge` once to combine
@@ -21,7 +22,7 @@
 # $OUT_DIR/confusion_matrices.txt.
 #
 # Usage:
-#   ./run_cluster.sh [OUT_DIR] [NUM_SWEEP_STEPS] [JOBS]
+#   ./run_cluster.sh [OUT_DIR] [NUM_SWEEP_STEPS] [JOBS] [CORPUS_SIZE]
 #
 #   OUT_DIR          Where results go. Default: sweep_out
 #   NUM_SWEEP_STEPS  Seed-list-size steps per require_tag_match_true/false
@@ -29,10 +30,19 @@
 #   JOBS             How many jobs to run at once (e.g. number of cores).
 #                     Default: number of cores on this machine (nproc), or
 #                     4 if nproc isn't available.
+#   CORPUS_SIZE      Optional: randomly subsample the corpus down to this
+#                     many sentences instead of using the full corpus
+#                     (forwarded as category_bootstrap.py's --corpus-size to
+#                     every job). Default: unset, i.e. use the full corpus.
+#                     By default this only subsamples the training pool,
+#                     keeping the same held-out test set across every corpus
+#                     size - set EXTRA_ARGS="--subsample-scope whole_corpus"
+#                     to subsample the test set too instead.
 #
 # Any extra category_bootstrap.py options (--corpus-file, --noun-seeds-file,
 # --verb-seeds-file, --cum-prop-threshold, --window-size, --test-fraction,
-# --split-seed) can be set via the EXTRA_ARGS environment variable, e.g.:
+# --split-seed, --subsample-scope) can be set via the EXTRA_ARGS environment
+# variable, e.g.:
 #   EXTRA_ARGS="--window-size 3" ./run_cluster.sh sweep_out 6 8
 #
 # On a SLURM (or similar) cluster, replace the `xargs -P "$JOBS"` line below
@@ -53,7 +63,13 @@ else
     DEFAULT_JOBS=4
 fi
 JOBS="${3:-$DEFAULT_JOBS}"
+CORPUS_SIZE="${4:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+
+CORPUS_SIZE_ARGS=""
+if [[ -n "$CORPUS_SIZE" ]]; then
+    CORPUS_SIZE_ARGS="--corpus-size $CORPUS_SIZE"
+fi
 
 mkdir -p "$OUT_DIR/summary_parts" "$OUT_DIR/confusion_parts"
 
@@ -61,10 +77,10 @@ JOBS_FILE="$(mktemp)"
 trap 'rm -f "$JOBS_FILE"' EXIT
 
 for pattern_type in 1 2 3; do
-    echo "python3 \"$PYTHON_SCRIPT\" --mode all_tagged_nouns_verbs --pattern-type $pattern_type --out-dir \"$OUT_DIR\" --num-sweep-steps $NUM_SWEEP_STEPS $EXTRA_ARGS" >> "$JOBS_FILE"
+    echo "python3 \"$PYTHON_SCRIPT\" --mode all_tagged_nouns_verbs --pattern-type $pattern_type --out-dir \"$OUT_DIR\" --num-sweep-steps $NUM_SWEEP_STEPS $CORPUS_SIZE_ARGS $EXTRA_ARGS" >> "$JOBS_FILE"
     for mode in require_tag_match_true require_tag_match_false; do
         for ((step = 0; step < NUM_SWEEP_STEPS; step++)); do
-            echo "python3 \"$PYTHON_SCRIPT\" --mode $mode --pattern-type $pattern_type --seed-step $step --out-dir \"$OUT_DIR\" --num-sweep-steps $NUM_SWEEP_STEPS $EXTRA_ARGS" >> "$JOBS_FILE"
+            echo "python3 \"$PYTHON_SCRIPT\" --mode $mode --pattern-type $pattern_type --seed-step $step --out-dir \"$OUT_DIR\" --num-sweep-steps $NUM_SWEEP_STEPS $CORPUS_SIZE_ARGS $EXTRA_ARGS" >> "$JOBS_FILE"
         done
     done
 done

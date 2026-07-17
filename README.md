@@ -32,7 +32,8 @@ Key concepts:
 
 - **Modes**: `all_tagged_nouns_verbs` (extract patterns from every corpus-tagged noun/verb, not just seeds), `require_tag_match_true` (a word only counts as a noun/verb seed if it's also tagged that way in the corpus), `require_tag_match_false` (seed list alone decides). The `require_tag_match_*` modes sweep across increasing seed-set sizes (smallest allowed by `--cum-prop-threshold`, doubling `--num-sweep-steps` times).
 - **Pattern types**: `--pattern-type 1/2/3`, three different ways of defining the context window pattern around a target word.
-- **Baseline**: every run also reports the score of a frequency-matched random-guess classifier, computed analytically (no simulation needed), for comparison.
+- **Baseline**: every run also reports the score of a random-guess classifier that guesses NOUN/VERB/OTHER in proportion to the training set's tag frequencies, scored against the test set, computed analytically (no simulation needed), for comparison.
+- **Corpus size**: `--corpus-size` randomly subsamples the corpus down to that many sentences instead of using the full corpus (deterministic given `--split-seed`). By default (`--subsample-scope train_only`) only the training pool is subsampled — the held-out test set is always the same fixed sentences regardless of corpus size, so results across different sizes are comparable against one fixed test set. `--subsample-scope whole_corpus` instead subsamples the full corpus before splitting, so the test set shrinks and changes between sizes too.
 
 Useful flags (see `python3 category_bootstrap.py --help` for the full list):
 
@@ -49,6 +50,8 @@ Useful flags (see `python3 category_bootstrap.py --help` for the full list):
 | `--noun-seeds-file` / `--verb-seeds-file` | `noun_selection.xlsx` / `verb_selection.xlsx` | seed files |
 | `--test-fraction` | 0.2 | fraction of sentences held out for testing |
 | `--split-seed` | 42 | RNG seed for the train/test split (keeps the split identical across independent processes) |
+| `--corpus-size` | (none = full corpus) | randomly subsample the corpus down to this many sentences |
+| `--subsample-scope` | `train_only` | `train_only` (fixed test set across corpus sizes) or `whole_corpus` (test set also shrinks) — only matters when `--corpus-size` is given |
 | `--merge` | off | merge `summary_parts`/`confusion_parts` into the final output files, then exit |
 
 Example — run everything in one process:
@@ -69,6 +72,7 @@ python3 category_bootstrap.py --merge --out-dir sweep_out
 - `<out-dir>/summary.csv` — one row per run, columns defined in `SUMMARY_COLS`: `time`, `mode`, `pattern_type`, `num_noun_seeds`, `num_verb_seeds`, `runtime_s`, per-class and macro/micro precision/recall, plus the same set prefixed `baseline_` for the random-guess comparison.
 - `<out-dir>/confusion_matrices.txt` — one confusion matrix per run (true axis = actual corpus tags, predicted axis = collapsed NOUN/VERB/OTHER), labeled with mode and pattern type.
 - `<out-dir>/confusion_words_*.csv` — word-level breakdown of everything predicted OTHER, one file per run.
+- `<out-dir>/pattern_usage_*.csv` — one file per run, one row per pattern actually used to classify a test-set word (not the full set of patterns extracted from training). Columns: `pattern`, `uses`, `num_true_noun`, `num_true_verb`, `predicted` (the pattern's winning label — a category or a specific word).
 
 ## Running the full comparison on a cluster
 
@@ -79,17 +83,19 @@ The full mode × pattern-type comparison (3 pattern types × (1 `all_tagged_noun
 Runs all jobs via `xargs -P`, using as many workers as requested (default: all cores), then merges.
 
 ```
-./run_cluster.sh [OUT_DIR] [NUM_SWEEP_STEPS] [JOBS]
+./run_cluster.sh [OUT_DIR] [NUM_SWEEP_STEPS] [JOBS] [CORPUS_SIZE]
 ```
 
 - `OUT_DIR` — default `sweep_out`
 - `NUM_SWEEP_STEPS` — default 6
 - `JOBS` — default: number of cores (`nproc`)
+- `CORPUS_SIZE` — optional; forwarded as `--corpus-size` to every job. Default: unset, i.e. full corpus.
 
-Extra `category_bootstrap.py` flags can be forwarded to every job via the `EXTRA_ARGS` environment variable:
+Extra `category_bootstrap.py` flags (including `--subsample-scope`) can be forwarded to every job via the `EXTRA_ARGS` environment variable:
 
 ```
 EXTRA_ARGS="--window-size 3" ./run_cluster.sh sweep_out 6 8
+EXTRA_ARGS="--subsample-scope whole_corpus" ./run_cluster.sh sweep_out 6 8 5000
 ```
 
 ### `run_cluster_slurm.sh` — SLURM job array
@@ -97,14 +103,15 @@ EXTRA_ARGS="--window-size 3" ./run_cluster.sh sweep_out 6 8
 Generates the same job list, then submits it as a SLURM array job (one array task per job) on the `serial` partition with a 1-day time limit, followed by a dependent merge job that only runs once the whole array has completed successfully.
 
 ```
-./run_cluster_slurm.sh [OUT_DIR] [NUM_SWEEP_STEPS] [MAX_CONCURRENT_TASKS]
+./run_cluster_slurm.sh [OUT_DIR] [NUM_SWEEP_STEPS] [MAX_CONCURRENT_TASKS] [CORPUS_SIZE]
 ```
 
 - `OUT_DIR` — default `sweep_out`
 - `NUM_SWEEP_STEPS` — default 6
 - `MAX_CONCURRENT_TASKS` — optional throttle on simultaneously running array tasks (`--array=1-N%K`); default unthrottled
+- `CORPUS_SIZE` — optional; forwarded as `--corpus-size` to every job. Default: unset, i.e. full corpus.
 
-Override the partition/time limit via the `PARTITION` / `TIME_LIMIT` environment variables (defaults: `serial` / `1-00:00:00`). `EXTRA_ARGS` works the same as in `run_cluster.sh`. The script only submits jobs and returns immediately — track progress with `squeue -u $USER`; results land in `<out-dir>/summary.csv` and `confusion_matrices.txt` once the merge job finishes. Per-task logs go to `<out-dir>/logs/`.
+Override the partition/time limit via the `PARTITION` / `TIME_LIMIT` environment variables (defaults: `serial` / `1-00:00:00`). `EXTRA_ARGS` works the same as in `run_cluster.sh` (e.g. `EXTRA_ARGS="--subsample-scope whole_corpus"` to also shrink the test set as corpus size shrinks). The script only submits jobs and returns immediately — track progress with `squeue -u $USER`; results land in `<out-dir>/summary.csv` and `confusion_matrices.txt` once the merge job finishes. Per-task logs go to `<out-dir>/logs/`.
 
 ## Notebooks
 

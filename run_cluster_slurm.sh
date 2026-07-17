@@ -15,11 +15,12 @@
 #   $OUT_DIR/summary_parts/*.csv
 #   $OUT_DIR/confusion_parts/*.txt
 #   $OUT_DIR/confusion_words_*.csv
+#   $OUT_DIR/pattern_usage_*.csv
 # so concurrent array tasks never write to the same file. The merge job
 # combines them into $OUT_DIR/summary.csv and $OUT_DIR/confusion_matrices.txt.
 #
 # Usage:
-#   ./run_cluster_slurm.sh [OUT_DIR] [NUM_SWEEP_STEPS] [MAX_CONCURRENT_TASKS]
+#   ./run_cluster_slurm.sh [OUT_DIR] [NUM_SWEEP_STEPS] [MAX_CONCURRENT_TASKS] [CORPUS_SIZE]
 #
 #   OUT_DIR                 Where results/logs go. Default: sweep_out
 #   NUM_SWEEP_STEPS          Seed-list-size steps per require_tag_match_true/
@@ -27,10 +28,20 @@
 #   MAX_CONCURRENT_TASKS     Optional throttle on simultaneously running
 #                            array tasks (SLURM's --array=1-N%K). Default:
 #                            unthrottled (let the scheduler decide).
+#   CORPUS_SIZE              Optional: randomly subsample the corpus down to
+#                            this many sentences instead of using the full
+#                            corpus (forwarded as category_bootstrap.py's
+#                            --corpus-size to every job). Default: unset,
+#                            i.e. use the full corpus. By default this only
+#                            subsamples the training pool, keeping the same
+#                            held-out test set across every corpus size -
+#                            set EXTRA_ARGS="--subsample-scope whole_corpus"
+#                            to subsample the test set too instead.
 #
 # Any extra category_bootstrap.py options (--corpus-file, --noun-seeds-file,
 # --verb-seeds-file, --cum-prop-threshold, --window-size, --test-fraction,
-# --split-seed) can be set via the EXTRA_ARGS environment variable, e.g.:
+# --split-seed, --subsample-scope) can be set via the EXTRA_ARGS environment
+# variable, e.g.:
 #   EXTRA_ARGS="--window-size 3" ./run_cluster_slurm.sh sweep_out 6
 #
 # This script only calls `sbatch` twice (array job + dependent merge job)
@@ -53,10 +64,16 @@ PYTHON_SCRIPT="$SCRIPT_DIR/category_bootstrap.py"
 OUT_DIR="${1:-sweep_out}"
 NUM_SWEEP_STEPS="${2:-6}"
 MAX_CONCURRENT_TASKS="${3:-}"
+CORPUS_SIZE="${4:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 PARTITION="${PARTITION:-serial}"
 TIME_LIMIT="${TIME_LIMIT:-1-00:00:00}"
+
+CORPUS_SIZE_ARGS=""
+if [[ -n "$CORPUS_SIZE" ]]; then
+    CORPUS_SIZE_ARGS="--corpus-size $CORPUS_SIZE"
+fi
 
 mkdir -p "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"   # make absolute: array tasks run later/elsewhere
@@ -66,10 +83,10 @@ JOBS_FILE="$OUT_DIR/jobs.txt"
 > "$JOBS_FILE"
 
 for pattern_type in 1 2 3; do
-    echo "python3 \"$PYTHON_SCRIPT\" --mode all_tagged_nouns_verbs --pattern-type $pattern_type --out-dir \"$OUT_DIR\" --num-sweep-steps $NUM_SWEEP_STEPS $EXTRA_ARGS" >> "$JOBS_FILE"
+    echo "python3 \"$PYTHON_SCRIPT\" --mode all_tagged_nouns_verbs --pattern-type $pattern_type --out-dir \"$OUT_DIR\" --num-sweep-steps $NUM_SWEEP_STEPS $CORPUS_SIZE_ARGS $EXTRA_ARGS" >> "$JOBS_FILE"
     for mode in require_tag_match_true require_tag_match_false; do
         for ((step = 0; step < NUM_SWEEP_STEPS; step++)); do
-            echo "python3 \"$PYTHON_SCRIPT\" --mode $mode --pattern-type $pattern_type --seed-step $step --out-dir \"$OUT_DIR\" --num-sweep-steps $NUM_SWEEP_STEPS $EXTRA_ARGS" >> "$JOBS_FILE"
+            echo "python3 \"$PYTHON_SCRIPT\" --mode $mode --pattern-type $pattern_type --seed-step $step --out-dir \"$OUT_DIR\" --num-sweep-steps $NUM_SWEEP_STEPS $CORPUS_SIZE_ARGS $EXTRA_ARGS" >> "$JOBS_FILE"
         done
     done
 done

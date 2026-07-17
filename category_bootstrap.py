@@ -357,30 +357,36 @@ def categorize_with_contexts_fast(df, tokens, targets,
         p3a = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", context[1] + "_X"))
 
         if pattern_type == 1:
-            cat = get_max_count_item(p1,df)
-            if cat is None:
-                cat =  get_max_count_item(p1a,df)
-            if cat not in ("NOUN", "VERB"):
-                cat = "OTHER"
-        if pattern_type == 2:
-            cat = get_max_count_item(p2,df)
-            if cat is None:
-                cat =  get_max_count_item(p2a,df)
-            if cat not in ("NOUN", "VERB"):
-                cat = "OTHER"
-        if pattern_type == 3:
-            cat =  get_max_count_item(p3,df)
-            if cat is None:
-                cat =  get_max_count_item(p3a,df)
-            if cat not in ("NOUN", "VERB"):
-                cat = "OTHER"
-        
-
-        # produce triple if tags provided, else pair
-        if tags is not None:
-            results.append((word, cat, tags[i]))
+            primary, fallback = p1, p1a
+        elif pattern_type == 2:
+            primary, fallback = p2, p2a
         else:
-            results.append((word, cat))
+            primary, fallback = p3, p3a
+
+        # raw_pred is the un-collapsed winning label from get_max_count_item -
+        # could be "NOUN"/"VERB", a specific corpus word (get_max_count_item
+        # can return any row label, not just NOUN/VERB), or the literal
+        # string "OTHER" (tie). used_pattern records which of the two
+        # patterns (primary or its short fallback) actually matched a column
+        # in the trained df - None if neither did, i.e. no trained pattern
+        # was actually used for this word (it fell through to OTHER for lack
+        # of any match at all).
+        raw_pred = get_max_count_item(primary, df)
+        used_pattern = primary
+        if raw_pred is None:
+            raw_pred = get_max_count_item(fallback, df)
+            used_pattern = fallback
+        if raw_pred is None:
+            used_pattern = None
+
+        cat = raw_pred if raw_pred in ("NOUN", "VERB") else "OTHER"
+
+        # produce triple if tags provided, else pair - both now carry the
+        # pattern-usage bookkeeping too.
+        if tags is not None:
+            results.append((word, cat, tags[i], used_pattern, raw_pred))
+        else:
+            results.append((word, cat, used_pattern, raw_pred))
 
     return results
 
@@ -482,8 +488,9 @@ def evaluate_single_run(
 ):
     """
     Runs a single (mode, pattern_type, seed-set) configuration and returns
-    everything needed to log it - (row, confusion_text, confusion_words) -
-    WITHOUT writing to any file. This is the atomic unit of work shared by:
+    everything needed to log it - (row, confusion_text, confusion_words,
+    pattern_usage) - WITHOUT writing to any file. This is the atomic unit of
+    work shared by:
       - sweep_and_save_runs, which appends the result to a shared
         summary.csv/confusion_matrices.txt (safe since it runs sequentially
         in a single process), and
@@ -512,6 +519,7 @@ def evaluate_single_run(
     confusion = metrics['confusion']
     confusion_words = metrics.get('confusion_words')
     baseline = metrics.get('baseline', {})
+    pattern_usage = metrics.get('pattern_usage')
 
     row = {
         "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t1)),
@@ -544,7 +552,7 @@ def evaluate_single_run(
         + confusion.to_string() + "\n\n"
     )
 
-    return row, confusion_text, confusion_words
+    return row, confusion_text, confusion_words, pattern_usage
 
 
 def sweep_and_save_runs(
@@ -619,7 +627,7 @@ def sweep_and_save_runs(
                 f"out_dir somewhere new, before re-running."
             )
 
-    def _log(row, confusion_text, confusion_words, num_nouns, num_verbs):
+    def _log(row, confusion_text, confusion_words, pattern_usage, num_nouns, num_verbs):
         pd.DataFrame([row]).to_csv(summary_path, mode="a", header=False, index=False)
 
         with open(confusion_path, "a", encoding="utf-8") as f:
@@ -634,8 +642,17 @@ def sweep_and_save_runs(
             confusion_words.to_csv(words_csv_path)
             print(f"Word-level confusion breakdown written to {words_csv_path}")
 
+        if pattern_usage is not None:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            pattern_usage_csv_path = os.path.join(
+                out_dir,
+                f"pattern_usage_{run_mode_safe}_p{pattern_type}_n{num_nouns}_v{num_verbs}_{ts}.csv",
+            )
+            pattern_usage.to_csv(pattern_usage_csv_path)
+            print(f"Pattern usage breakdown written to {pattern_usage_csv_path}")
+
     def _run_and_log(selected_nouns, selected_verbs, num_nouns, num_verbs):
-        row, confusion_text, confusion_words = evaluate_single_run(
+        row, confusion_text, confusion_words, pattern_usage = evaluate_single_run(
             run_fn, train_tokens, test_tokens, test_tags,
             selected_nouns, selected_verbs, num_nouns, num_verbs,
             token_counts, sorted_noun_tokens, sorted_verb_tokens,
@@ -643,7 +660,7 @@ def sweep_and_save_runs(
             train_tags=train_tags, require_tag_match=require_tag_match,
             all_tagged_nouns_verbs=all_tagged_nouns_verbs, run_mode=run_mode,
         )
-        _log(row, confusion_text, confusion_words, num_nouns, num_verbs)
+        _log(row, confusion_text, confusion_words, pattern_usage, num_nouns, num_verbs)
 
     if all_tagged_nouns_verbs or force_full_seeds:
         # Single full pass, no sweep over increasing seed-list sizes.
@@ -842,9 +859,16 @@ def strict_precision_recall(results, train_tags=None):
     labels (see baseline_random_scores) - no confusion matrix is built for
     it. If train_tags isn't provided, falls back to guessing in proportion
     to the test set's own tag frequencies instead.
-    Returns dict {per_class, micro, macro, confusion, confusion_words, baseline}.
+    Also returns 'pattern_usage': a table of only the patterns actually used
+    to classify a test-set word (not the full set of patterns extracted from
+    training) - one row per pattern, with the number of times it was used,
+    how many of those words were actually nouns/verbs in the test set (per
+    true_mapped), and the pattern's predicted output (a category or a
+    specific word, whichever get_max_count_item picked for that pattern).
+    Returns dict {per_class, micro, macro, confusion, confusion_words,
+    baseline, pattern_usage}.
     """
-    df = pd.DataFrame(results, columns=['token','pred','true'])
+    df = pd.DataFrame(results, columns=['token', 'pred', 'true', 'used_pattern', 'raw_pred'])
     df['pred_mapped'] = df['pred'].where(df['pred'].isin(['NOUN','VERB']), 'OTHER')
     df['true_mapped'] = df['true'].where(df['true'].isin(['NOUN','VERB']), 'OTHER')
 
@@ -921,6 +945,27 @@ def strict_precision_recall(results, train_tags=None):
             }
     baseline = baseline_random_scores(df['true_mapped'], guess_probs=guess_probs)
 
+    # Patterns actually used to classify a test-set word - not the full set
+    # of patterns extract_context_patterns_fast produced from training, only
+    # the ones get_max_count_item actually matched at test time (see
+    # categorize_with_contexts_fast). used_pattern is None for words where
+    # neither the primary nor fallback pattern matched any trained column at
+    # all (nothing to report there, so those rows are excluded).
+    used_df = df[df['used_pattern'].notna()]
+    if len(used_df) > 0:
+        pattern_usage = used_df.groupby('used_pattern').agg(
+            uses=('used_pattern', 'size'),
+            num_true_noun=('true_mapped', lambda s: int((s == 'NOUN').sum())),
+            num_true_verb=('true_mapped', lambda s: int((s == 'VERB').sum())),
+            predicted=('raw_pred', 'first'),
+        )
+        pattern_usage.index.name = 'pattern'
+        pattern_usage = pattern_usage.sort_values('uses', ascending=False)
+    else:
+        pattern_usage = pd.DataFrame(
+            columns=['uses', 'num_true_noun', 'num_true_verb', 'predicted']
+        ).rename_axis('pattern')
+
     print(detailed_confusion)
     return {
         'per_class': per_class,
@@ -929,11 +974,13 @@ def strict_precision_recall(results, train_tags=None):
         'confusion': detailed_confusion,
         'confusion_words': confusion_words,
         'baseline': baseline,
+        'pattern_usage': pattern_usage,
     }
 
 ### RUNTIME CODE STARTS HERE ###
 
-def load_corpus_and_split(corpus_file, split_seed=42, test_fraction=0.2):
+def load_corpus_and_split(corpus_file, split_seed=42, test_fraction=0.2,
+                           corpus_size=None, subsample_scope="train_only"):
     """
     Reads the WORD_LEMMA_TAG corpus file, builds the flat token/tag lists
     (lemma-lowercased, sentence-bounded by "{"/"}"), then splits it into
@@ -943,6 +990,25 @@ def load_corpus_and_split(corpus_file, split_seed=42, test_fraction=0.2):
     run_cluster.sh dispatch each (mode, pattern_type, seed-set) combination
     to its own independent process/core without sharing any state: each
     process just redoes this same deterministic corpus load+split itself).
+
+    corpus_size: if given, randomly subsample down to this many sentences
+        (utterances) instead of using the full corpus. None (default) means
+        no subsampling - use every sentence, exactly as before. Which
+        sentences this affects depends on subsample_scope:
+          "train_only" (default) - the held-out test set is always the same
+              test_fraction of sentences drawn from the FULL corpus, i.e.
+              unaffected by corpus_size, so results across different corpus
+              sizes stay comparable against one fixed test set. Only the
+              training pool is subsampled down to corpus_size sentences (if
+              corpus_size is at least as large as the full training pool,
+              the full pool is used - no error).
+          "whole_corpus" - the full corpus is subsampled down to
+              corpus_size sentences FIRST, then split test_fraction/
+              (1 - test_fraction) as usual, so both train and test shrink
+              and the test set itself changes between corpus sizes.
+        Sampling is deterministic given split_seed (same seed used for the
+        train/test split itself), so every independent process reproduces
+        the exact same subsample.
 
     Returns (train, test, train_tags, test_tags, token_counts,
     sorted_noun_tokens, sorted_verb_tokens).
@@ -990,7 +1056,6 @@ def load_corpus_and_split(corpus_file, split_seed=42, test_fraction=0.2):
     # sentences for test. Find all indices where a sentence ends ("}"), then
     # derive (start, end) bounds for each sentence (a sentence runs from
     # just after the previous "}" through its own "}", inclusive).
-    random.seed(split_seed)
     sentence_end_indices = [i for i, tok in enumerate(tokens) if tok == "}"]
     sentence_bounds = []
     start = 0
@@ -999,17 +1064,59 @@ def load_corpus_and_split(corpus_file, split_seed=42, test_fraction=0.2):
         start = end + 1
 
     n_sentences = len(sentence_bounds)
-    n_test = int(n_sentences * test_fraction)
-    test_sentence_idx = set(random.sample(range(n_sentences), n_test))
+    if corpus_size is not None:
+        if corpus_size < 1:
+            raise ValueError(f"--corpus-size must be at least 1, got {corpus_size}")
+        if corpus_size > n_sentences:
+            raise ValueError(
+                f"--corpus-size {corpus_size} exceeds the corpus's {n_sentences} sentences"
+            )
+        if subsample_scope not in ("train_only", "whole_corpus"):
+            raise ValueError(f"Unknown subsample_scope {subsample_scope!r}")
+
+    # Single RNG instance, seeded once, shared by every sampling step below -
+    # deterministic given split_seed, so every independent process (see
+    # run_cluster.sh) reproduces the exact same draws in the exact same
+    # order.
+    rng = random.Random(split_seed)
+
+    if corpus_size is not None and subsample_scope == "whole_corpus":
+        # Subsample the whole corpus down to corpus_size sentences first, so
+        # both train and test shrink together (test set changes between
+        # corpus sizes).
+        sentence_pool = rng.sample(range(n_sentences), corpus_size)
+    else:
+        sentence_pool = list(range(n_sentences))
+
+    # Test set: test_fraction of sentence_pool. When subsample_scope isn't
+    # "whole_corpus" (including corpus_size=None), sentence_pool is always
+    # the full range(n_sentences) here, so this draw - and therefore the
+    # resulting test set - is identical regardless of corpus_size, exactly
+    # as the "train_only" scope requires.
+    n_test = int(len(sentence_pool) * test_fraction)
+    test_sentence_idx = set(rng.sample(sentence_pool, n_test))
+    train_pool = [i for i in sentence_pool if i not in test_sentence_idx]
+
+    if corpus_size is not None and subsample_scope == "train_only" and corpus_size < len(train_pool):
+        train_pool = rng.sample(train_pool, corpus_size)
+    train_idx_set = set(train_pool)
 
     train, test, train_tags, test_tags = [], [], [], []
     for i, (s, e) in enumerate(sentence_bounds):
         if i in test_sentence_idx:
             test.extend(tokens[s:e + 1])
             test_tags.extend(tags[s:e + 1])
-        else:
+        elif i in train_idx_set:
             train.extend(tokens[s:e + 1])
             train_tags.extend(tags[s:e + 1])
+        # else: excluded by subsampling - neither train nor test.
+
+    if corpus_size is not None:
+        print(
+            f"Corpus subsampled (scope={subsample_scope}, corpus_size={corpus_size}): "
+            f"{len(train_idx_set)} train sentence(s), {len(test_sentence_idx)} test sentence(s) "
+            f"(of {n_sentences} total)."
+        )
 
     return train, test, train_tags, test_tags, token_counts, sorted_noun_tokens, sorted_verb_tokens
 
@@ -1095,6 +1202,22 @@ def build_arg_parser():
     parser.add_argument("--test-fraction", type=float, default=0.2)
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument(
+        "--corpus-size", type=int, default=None,
+        help="Randomly subsample the corpus down to this many sentences instead of "
+             "using the full corpus. Default (unset) uses the full corpus. See "
+             "--subsample-scope for what exactly gets subsampled.",
+    )
+    parser.add_argument(
+        "--subsample-scope", choices=["train_only", "whole_corpus"], default="train_only",
+        help="Only relevant when --corpus-size is given. 'train_only' (default) keeps "
+             "the held-out test set fixed (always the same test_fraction of the FULL "
+             "corpus) and only subsamples the training pool down to --corpus-size, so "
+             "results across different corpus sizes stay comparable against one fixed "
+             "test set. 'whole_corpus' subsamples the full corpus down to --corpus-size "
+             "sentences first, then splits as usual, so the test set also shrinks and "
+             "changes between corpus sizes.",
+    )
+    parser.add_argument(
         "--merge", action="store_true",
         help="Merge <out-dir>/summary_parts and confusion_parts into the final "
              "summary.csv/confusion_matrices.txt, then exit (skips everything else).",
@@ -1112,6 +1235,7 @@ def main():
     (train, test, train_tags, test_tags, token_counts,
      sorted_noun_tokens, sorted_verb_tokens) = load_corpus_and_split(
         args.corpus_file, split_seed=args.split_seed, test_fraction=args.test_fraction,
+        corpus_size=args.corpus_size, subsample_scope=args.subsample_scope,
     )
 
     noun_seeds = pd.read_excel(args.noun_seeds_file)
@@ -1182,7 +1306,7 @@ def main():
         selected_verbs = verb_seeds_f.iloc[:num_verbs]['Word'].tolist()
         step_label = f"step{args.seed_step}"
 
-    row, confusion_text, confusion_words = evaluate_single_run(
+    row, confusion_text, confusion_words, pattern_usage = evaluate_single_run(
         run_extract_and_evaluate, train, test, test_tags,
         selected_nouns, selected_verbs, num_nouns, num_verbs,
         token_counts, sorted_noun_tokens, sorted_verb_tokens,
@@ -1203,6 +1327,12 @@ def main():
         words_csv_path = os.path.join(args.out_dir, f"confusion_words_{job_id}_{ts}.csv")
         confusion_words.to_csv(words_csv_path)
         print(f"Word-level confusion breakdown written to {words_csv_path}")
+
+    if pattern_usage is not None:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        pattern_usage_csv_path = os.path.join(args.out_dir, f"pattern_usage_{job_id}_{ts}.csv")
+        pattern_usage.to_csv(pattern_usage_csv_path)
+        print(f"Pattern usage breakdown written to {pattern_usage_csv_path}")
 
     print(f"Single-run result written to {parts_dir}/{job_id}.csv and {conf_parts_dir}/{job_id}.txt")
 

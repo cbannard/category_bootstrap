@@ -272,7 +272,7 @@ def run_extract_and_evaluate(
         all_tagged_nouns_verbs=all_tagged_nouns_verbs,
     )
 
-    metrics = strict_precision_recall(results)
+    metrics = strict_precision_recall(results, train_tags=train_tags)
     return metrics
 
 
@@ -737,20 +737,28 @@ def run_mode_comparison(
 
     return summary_path, confusion_path
 
-def baseline_random_scores(true_mapped):
+def baseline_random_scores(true_mapped, guess_probs=None):
     """
     Expected precision/recall/F1 of a baseline that assigns NOUN/VERB/OTHER
-    to each instance independently at random, with probabilities equal to
-    the empirical frequency of each tag among true_mapped - i.e. "guess
-    NOUN/VERB/OTHER in proportion to how often each actually occurs in this
-    test set." Computed analytically in closed form (no simulation, no
-    confusion matrix), using the same scoring convention as
-    strict_precision_recall: a predicted OTHER is never counted as a TP, and
-    every true-OTHER instance counts fully as a miss (FN) regardless of what
-    was predicted.
+    to each instance in true_mapped independently at random, with
+    probabilities guess_probs (a dict with keys 'NOUN'/'VERB'/'OTHER').
+    Computed analytically in closed form (no simulation, no confusion
+    matrix), using the same scoring convention as strict_precision_recall: a
+    predicted OTHER is never counted as a TP, and every true-OTHER instance
+    counts fully as a miss (FN) regardless of what was predicted.
 
     true_mapped: an iterable of 'NOUN'/'VERB'/'OTHER' labels (already
-    collapsed - anything not NOUN/VERB should already be 'OTHER').
+    collapsed - anything not NOUN/VERB should already be 'OTHER') for the
+    set actually being scored (i.e. the test set) - this determines n and
+    the per-class true counts that TP/FP/FN are computed against.
+
+    guess_probs: dict of guess probabilities for 'NOUN'/'VERB'/'OTHER'
+    (should sum to ~1). This is deliberately independent of true_mapped, so
+    the guess distribution can come from a different set than the one being
+    scored - e.g. guess in proportion to the TRAINING set's tag frequencies,
+    then score those guesses against the test set's actual labels. If None,
+    defaults to true_mapped's own empirical frequency (guess in proportion
+    to the scored set's own tag frequencies).
 
     Returns a flat dict: NOUN_precision, NOUN_recall, VERB_precision,
     VERB_recall, macro_precision, macro_recall, micro_precision,
@@ -767,9 +775,14 @@ def baseline_random_scores(true_mapped):
     n_noun = int(counts.get('NOUN', 0))
     n_verb = int(counts.get('VERB', 0))
     n_other = int(counts.get('OTHER', 0))
-    p_noun = n_noun / n
-    p_verb = n_verb / n
-    p_other = n_other / n
+    if guess_probs is None:
+        p_noun = n_noun / n
+        p_verb = n_verb / n
+        p_other = n_other / n
+    else:
+        p_noun = guess_probs.get('NOUN', 0.0)
+        p_verb = guess_probs.get('VERB', 0.0)
+        p_other = guess_probs.get('OTHER', 0.0)
 
     def class_stats(n_true_l, p_l):
         TP = n_true_l * p_l
@@ -806,7 +819,7 @@ def baseline_random_scores(true_mapped):
     }
 
 
-def strict_precision_recall(results):
+def strict_precision_recall(results, train_tags=None):
     """
     Scoring per your rules:
       - map preds -> 'NOUN'/'VERB' else 'OTHER'
@@ -823,9 +836,12 @@ def strict_precision_recall(results):
     stay NOUN/VERB/OTHER. A separate, more granular breakdown is returned as
     'confusion_words': same rows, but every word the categorizer didn't put
     in NOUN/VERB gets its own column instead of being lumped into OTHER.
-    Also returns 'baseline': the scores a random guesser would get matching
-    this run's true-tag frequencies (see baseline_random_scores) - no
-    confusion matrix is built for it.
+    Also returns 'baseline': the scores a random guesser would get if it
+    guessed NOUN/VERB/OTHER in proportion to the TRAINING set's tag
+    frequencies (train_tags), scored against this run's actual test-set
+    labels (see baseline_random_scores) - no confusion matrix is built for
+    it. If train_tags isn't provided, falls back to guessing in proportion
+    to the test set's own tag frequencies instead.
     Returns dict {per_class, micro, macro, confusion, confusion_words, baseline}.
     """
     df = pd.DataFrame(results, columns=['token','pred','true'])
@@ -886,7 +902,24 @@ def strict_precision_recall(results):
     macro_p = per_class.loc[classes, 'precision'].mean()
     macro_r = per_class.loc[classes, 'recall'].mean()
     macro_f = per_class.loc[classes, 'f1'].mean()
-    baseline = baseline_random_scores(df['true_mapped'])
+
+    guess_probs = None
+    if train_tags is not None:
+        # Exclude "{"/"}" sentence-boundary markers (tagged BOS/EOS) - they
+        # aren't real word tokens and are likewise excluded on the test side
+        # (categorize_with_contexts_fast never scores them), so leaving them
+        # in here would inflate OTHER relative to the test set's convention.
+        train_true = pd.Series([t for t in train_tags if t not in ('BOS', 'EOS')])
+        if len(train_true) > 0:
+            train_mapped = train_true.where(train_true.isin(['NOUN', 'VERB']), 'OTHER')
+            train_counts = train_mapped.value_counts()
+            n_train = len(train_mapped)
+            guess_probs = {
+                'NOUN': train_counts.get('NOUN', 0) / n_train,
+                'VERB': train_counts.get('VERB', 0) / n_train,
+                'OTHER': train_counts.get('OTHER', 0) / n_train,
+            }
+    baseline = baseline_random_scores(df['true_mapped'], guess_probs=guess_probs)
 
     print(detailed_confusion)
     return {

@@ -267,6 +267,7 @@ def run_extract_and_evaluate(
         sorted_noun_tokens,
         sorted_verb_tokens,
         window_size=window_size,
+        pattern_type=pattern_type,
         tags=test_tags,
         all_tagged_nouns_verbs=all_tagged_nouns_verbs,
     )

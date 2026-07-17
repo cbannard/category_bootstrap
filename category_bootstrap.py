@@ -254,6 +254,18 @@ def run_extract_and_evaluate(
         all_tagged_nouns_verbs=all_tagged_nouns_verbs,
     )
 
+    # Baseline guess probabilities: how often THIS run's own patterns
+    # predict NOUN/VERB/OTHER when self-classifying the training
+    # occurrences that built them, rather than the training set's raw tag
+    # frequency. Falls back to None (-> baseline_random_scores defaults to
+    # the test set's own frequency) if there were no such occurrences at
+    # all (e.g. an empty seed list).
+    guess_probs = compute_pattern_guess_probs(
+        train_tokens, seeds, df_contexts, window_size=window_size, pattern_type=pattern_type,
+        corpus_tags=train_tags, require_tag_match=require_tag_match,
+        all_tagged_nouns_verbs=all_tagged_nouns_verbs,
+    )
+
     corpus_total = sum(token_counts.values())
     token_probs = {k: (v / corpus_total) for k, v in token_counts.items()}
     targets = [k for k, p in token_probs.items() if p < target_prob_cutoff]
@@ -272,7 +284,7 @@ def run_extract_and_evaluate(
         all_tagged_nouns_verbs=all_tagged_nouns_verbs,
     )
 
-    metrics = strict_precision_recall(results, train_tags=train_tags)
+    metrics = strict_precision_recall(results, guess_probs=guess_probs)
     return metrics
 
 
@@ -389,6 +401,119 @@ def categorize_with_contexts_fast(df, tokens, targets,
             results.append((word, cat, used_pattern, raw_pred))
 
     return results
+
+
+def compute_pattern_guess_probs(corpus, seeds, df, window_size=2, pattern_type=1,
+                                 corpus_tags=None, require_tag_match=False,
+                                 all_tagged_nouns_verbs=False):
+    """
+    Self-classification pass over the TRAINING corpus, used as the guess-
+    probability source for the baseline instead of the training set's raw
+    tag frequency.
+
+    For every training-corpus occurrence where the target word is itself a
+    noun/verb by this run's own criteria (seeds/require_tag_match/
+    all_tagged_nouns_verbs - i.e. every occurrence that fed into the NOUN/
+    VERB rows of df when it was built by extract_context_patterns_fast),
+    this predicts its category using the already-built df (the same
+    primary/fallback pattern lookup categorize_with_contexts_fast uses at
+    test time) and tallies how often the model's own patterns output NOUN/
+    VERB/OTHER. E.g. if seed words occur 100 times in training and the
+    model's patterns classify 10 of those occurrences as NOUN, 10 as VERB,
+    and 80 as OTHER (no confident match), the returned guess probabilities
+    are 0.1/0.1/0.8 - reflecting how decisive/skewed this particular
+    pattern set actually is, rather than the corpus's raw tag proportions.
+
+    Returns a dict {'NOUN': p_noun, 'VERB': p_verb, 'OTHER': p_other}, or
+    None if there were no such occurrences to evaluate (e.g. an empty seed
+    list) - callers should fall back to some other guess distribution in
+    that case.
+    """
+    if (require_tag_match or all_tagged_nouns_verbs) and corpus_tags is None:
+        raise ValueError("corpus_tags must be provided when require_tag_match=True or all_tagged_nouns_verbs=True")
+
+    seeds = seeds or {}
+    noun_set = set(seeds.get('nouns', []))
+    verb_set = set(seeds.get('verbs', []))
+
+    def is_noun(w, idx):
+        if all_tagged_nouns_verbs:
+            return bool(re.match(r"^N", corpus_tags[idx]))
+        if w not in noun_set:
+            return False
+        if require_tag_match:
+            return bool(re.match(r"^N", corpus_tags[idx]))
+        return True
+
+    def is_verb(w, idx):
+        if all_tagged_nouns_verbs:
+            return bool(re.match(r"^V", corpus_tags[idx]))
+        if w not in verb_set:
+            return False
+        if require_tag_match:
+            return bool(re.match(r"^V", corpus_tags[idx]))
+        return True
+
+    counts = {'NOUN': 0, 'VERB': 0, 'OTHER': 0}
+    total = 0
+
+    for i, word in enumerate(corpus):
+        if word in ("{", "}"):
+            continue
+        # Restrict to occurrences that are themselves a noun/verb by this
+        # run's criteria - exactly the occurrences that fed the NOUN/VERB
+        # rows of df at train time (noun takes priority over verb on
+        # overlap for the TARGET word, matching extract_context_patterns_fast
+        # - note this is the opposite priority from context words below,
+        # where verb takes priority; that asymmetry is intentional and
+        # already present in extract_context_patterns_fast).
+        if not (is_noun(word, i) or is_verb(word, i)):
+            continue
+
+        begin = max(i - window_size, 0)
+        end = min(i + window_size, len(corpus) - 1)
+        context_indices = list(range(begin, end + 1))
+        del context_indices[i - begin]
+
+        context = []
+        for idx in context_indices:
+            w = corpus[idx]
+            if is_verb(w, idx):
+                context.append("verb")
+            elif is_noun(w, idx):
+                context.append("noun")
+            else:
+                context.append(w)
+
+        if len(context) != 4:
+            continue
+
+        p1 = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", context[1] + "_X_" + context[2]))
+        p1a = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", context[1] + "_X"))
+        p2 = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", "X_" + context[2] + "_" + context[3]))
+        p2a = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", "X_" + context[2]))
+        p3 = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", context[0] + "_" + context[1] + "_X"))
+        p3a = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", context[1] + "_X"))
+
+        if pattern_type == 1:
+            primary, fallback = p1, p1a
+        elif pattern_type == 2:
+            primary, fallback = p2, p2a
+        else:
+            primary, fallback = p3, p3a
+
+        raw_pred = get_max_count_item(primary, df)
+        if raw_pred is None:
+            raw_pred = get_max_count_item(fallback, df)
+
+        cat = raw_pred if raw_pred in ("NOUN", "VERB") else "OTHER"
+        counts[cat] += 1
+        total += 1
+
+    if total == 0:
+        return None
+
+    return {c: counts[c] / total for c in ('NOUN', 'VERB', 'OTHER')}
 
 
 SUMMARY_COLS = [
@@ -836,7 +961,7 @@ def baseline_random_scores(true_mapped, guess_probs=None):
     }
 
 
-def strict_precision_recall(results, train_tags=None):
+def strict_precision_recall(results, guess_probs=None):
     """
     Scoring per your rules:
       - map preds -> 'NOUN'/'VERB' else 'OTHER'
@@ -854,11 +979,13 @@ def strict_precision_recall(results, train_tags=None):
     'confusion_words': same rows, but every word the categorizer didn't put
     in NOUN/VERB gets its own column instead of being lumped into OTHER.
     Also returns 'baseline': the scores a random guesser would get if it
-    guessed NOUN/VERB/OTHER in proportion to the TRAINING set's tag
-    frequencies (train_tags), scored against this run's actual test-set
-    labels (see baseline_random_scores) - no confusion matrix is built for
-    it. If train_tags isn't provided, falls back to guessing in proportion
-    to the test set's own tag frequencies instead.
+    guessed NOUN/VERB/OTHER with probabilities guess_probs, scored against
+    this run's actual test-set labels (see baseline_random_scores) - no
+    confusion matrix is built for it. guess_probs is expected to come from
+    compute_pattern_guess_probs (how often THIS run's own patterns predict
+    each category, self-classifying the training data), passed in by the
+    caller. If guess_probs isn't provided, falls back to guessing in
+    proportion to the test set's own tag frequencies instead.
     Also returns 'pattern_usage': a table of only the patterns actually used
     to classify a test-set word (not the full set of patterns extracted from
     training) - one row per pattern, with the number of times it was used,
@@ -927,22 +1054,6 @@ def strict_precision_recall(results, train_tags=None):
     macro_r = per_class.loc[classes, 'recall'].mean()
     macro_f = per_class.loc[classes, 'f1'].mean()
 
-    guess_probs = None
-    if train_tags is not None:
-        # Exclude "{"/"}" sentence-boundary markers (tagged BOS/EOS) - they
-        # aren't real word tokens and are likewise excluded on the test side
-        # (categorize_with_contexts_fast never scores them), so leaving them
-        # in here would inflate OTHER relative to the test set's convention.
-        train_true = pd.Series([t for t in train_tags if t not in ('BOS', 'EOS')])
-        if len(train_true) > 0:
-            train_mapped = train_true.where(train_true.isin(['NOUN', 'VERB']), 'OTHER')
-            train_counts = train_mapped.value_counts()
-            n_train = len(train_mapped)
-            guess_probs = {
-                'NOUN': train_counts.get('NOUN', 0) / n_train,
-                'VERB': train_counts.get('VERB', 0) / n_train,
-                'OTHER': train_counts.get('OTHER', 0) / n_train,
-            }
     baseline = baseline_random_scores(df['true_mapped'], guess_probs=guess_probs)
 
     # Patterns actually used to classify a test-set word - not the full set

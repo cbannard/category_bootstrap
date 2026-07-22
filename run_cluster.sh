@@ -6,9 +6,13 @@
 #
 # What gets run (39 jobs with the defaults: 3 pattern types x (1 + 6 + 6)):
 #   For pattern_type in 1 2 3:
-#     - all_tagged_nouns_verbs           (1 job)
-#     - require_tag_match_true,  steps 0..NUM_SWEEP_STEPS-1   (NUM_SWEEP_STEPS jobs)
-#     - require_tag_match_false, steps 0..NUM_SWEEP_STEPS-1   (NUM_SWEEP_STEPS jobs)
+#     - all_tagged_nouns_verbs           (1 job - uses every word tagged
+#                                          noun/verb in the postprocessed
+#                                          corpus itself, not the curated
+#                                          noun_selection.xlsx/verb_selection.xlsx
+#                                          seed lists)
+#     - require_tag_match_true,  steps 0..NUM_SWEEP_STEPS-1   (NUM_SWEEP_STEPS jobs - seed-list-based)
+#     - require_tag_match_false, steps 0..NUM_SWEEP_STEPS-1   (NUM_SWEEP_STEPS jobs - seed-list-based)
 #
 # Each job writes its own uniquely-named file under
 #   $OUT_DIR/summary_parts/*.csv
@@ -49,11 +53,24 @@
 # with your job submission command (e.g. `srun`, `sbatch --wait`, or a job
 # array) reading the same one-command-per-line job list - everything else
 # (unique per-job output files + the final --merge step) stays the same.
+#
+# REGENERATE_SEEDS  Set to 0 to skip the from_tagged_corpus_to_seeds.py
+#                     preflight step below and dispatch jobs against whatever
+#                     manchester_input_tagged_trf_word_and_lemma_postprocessed.txt
+#                     / noun_selection.xlsx / verb_selection.xlsx already
+#                     exist on disk. Default: 1 (regenerate every time), so a
+#                     sweep never silently runs against a stale postprocessed
+#                     corpus or seed list (e.g. after editing
+#                     from_tagged_corpus_to_seeds.py's tag cleanup rules or
+#                     verb_inclusion.xlsx's Include judgments). Requires
+#                     network access the first time, to fetch nltk's wordnet
+#                     data and the `wn` package's omw-en:1.4 lexicon.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_SCRIPT="$SCRIPT_DIR/category_bootstrap.py"
+SEEDS_SCRIPT="$SCRIPT_DIR/from_tagged_corpus_to_seeds.py"
 
 OUT_DIR="${1:-sweep_out}"
 NUM_SWEEP_STEPS="${2:-6}"
@@ -65,10 +82,24 @@ fi
 JOBS="${3:-$DEFAULT_JOBS}"
 CORPUS_SIZE="${4:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+REGENERATE_SEEDS="${REGENERATE_SEEDS:-1}"
 
 CORPUS_SIZE_ARGS=""
 if [[ -n "$CORPUS_SIZE" ]]; then
     CORPUS_SIZE_ARGS="--corpus-size $CORPUS_SIZE"
+fi
+
+if [[ "$REGENERATE_SEEDS" == "1" ]]; then
+    echo "Regenerating postprocessed corpus and seed files (from_tagged_corpus_to_seeds.py)..."
+    (cd "$SCRIPT_DIR" && python3 "$SEEDS_SCRIPT")
+    echo "Refreshing noun_selection.xlsx/verb_selection.xlsx from the regenerated .csv files..."
+    python3 -c "
+import pandas as pd
+pd.read_csv('$SCRIPT_DIR/noun_selection.csv', index_col=0).to_excel('$SCRIPT_DIR/noun_selection.xlsx')
+pd.read_csv('$SCRIPT_DIR/verb_selection.csv', index_col=0).to_excel('$SCRIPT_DIR/verb_selection.xlsx')
+"
+else
+    echo "REGENERATE_SEEDS=0: skipping from_tagged_corpus_to_seeds.py, using existing corpus/seed files as-is."
 fi
 
 mkdir -p "$OUT_DIR/summary_parts" "$OUT_DIR/confusion_parts"

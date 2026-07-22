@@ -44,6 +44,18 @@
 # variable, e.g.:
 #   EXTRA_ARGS="--window-size 3" ./run_cluster_slurm.sh sweep_out 6
 #
+# REGENERATE_SEEDS  Set to 0 to skip the from_tagged_corpus_to_seeds.py
+#                     preflight step below and submit jobs against whatever
+#                     manchester_input_tagged_trf_word_and_lemma_postprocessed.txt
+#                     / noun_selection.xlsx / verb_selection.xlsx already
+#                     exist on disk. Default: 1 (regenerate every time), so a
+#                     sweep never silently runs against a stale postprocessed
+#                     corpus or seed list. This runs once, here on the
+#                     submission host, before any `sbatch` call - not per
+#                     array task - since it needs network access (nltk's
+#                     wordnet data, the `wn` package's omw-en:1.4 lexicon)
+#                     that compute nodes may not have.
+#
 # This script only calls `sbatch` twice (array job + dependent merge job)
 # and returns immediately - it does not wait for the run to finish. Track
 # progress with `squeue -u $USER`. Once the merge job completes, results
@@ -60,12 +72,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_SCRIPT="$SCRIPT_DIR/category_bootstrap.py"
+SEEDS_SCRIPT="$SCRIPT_DIR/from_tagged_corpus_to_seeds.py"
 
 OUT_DIR="${1:-sweep_out}"
 NUM_SWEEP_STEPS="${2:-6}"
 MAX_CONCURRENT_TASKS="${3:-}"
 CORPUS_SIZE="${4:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+REGENERATE_SEEDS="${REGENERATE_SEEDS:-1}"
 
 PARTITION="${PARTITION:-serial}"
 TIME_LIMIT="${TIME_LIMIT:-1-00:00:00}"
@@ -73,6 +87,19 @@ TIME_LIMIT="${TIME_LIMIT:-1-00:00:00}"
 CORPUS_SIZE_ARGS=""
 if [[ -n "$CORPUS_SIZE" ]]; then
     CORPUS_SIZE_ARGS="--corpus-size $CORPUS_SIZE"
+fi
+
+if [[ "$REGENERATE_SEEDS" == "1" ]]; then
+    echo "Regenerating postprocessed corpus and seed files (from_tagged_corpus_to_seeds.py)..."
+    (cd "$SCRIPT_DIR" && python3 "$SEEDS_SCRIPT")
+    echo "Refreshing noun_selection.xlsx/verb_selection.xlsx from the regenerated .csv files..."
+    python3 -c "
+import pandas as pd
+pd.read_csv('$SCRIPT_DIR/noun_selection.csv', index_col=0).to_excel('$SCRIPT_DIR/noun_selection.xlsx')
+pd.read_csv('$SCRIPT_DIR/verb_selection.csv', index_col=0).to_excel('$SCRIPT_DIR/verb_selection.xlsx')
+"
+else
+    echo "REGENERATE_SEEDS=0: skipping from_tagged_corpus_to_seeds.py, using existing corpus/seed files as-is."
 fi
 
 mkdir -p "$OUT_DIR"

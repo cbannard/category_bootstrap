@@ -25,6 +25,16 @@ with open(output_filename, 'w') as fi:
             line = re.sub("useta_[A-Z]+","useta_VERB",line)
             line = re.sub("hadta_[A-Z]+","hadta_VERB",line)
             line = re.sub("([^ \\_]+)_AUX","\\1_VERB",line)
+            # be/do/have are excluded from the VERB category entirely - a
+            # blanket exclusion covering both auxiliary and lexical/main-verb
+            # uses (e.g. "have" meaning possess, "do" as a main verb). Retag
+            # any occurrence (whichever tag it ended up with above) back to
+            # AUX, so all_tagged_nouns_verbs=True mode - which reads the tag
+            # directly and doesn't consult seed lists - never counts these
+            # three lemmas as verbs either. This mirrors the existing
+            # INCLUDE_human=0 exclusion for be/do/have in
+            # verb_inclusion.xlsx, which only covers the seed-based modes.
+            line = re.sub(r"([^ \_]+)_(be|do|have)_(VERB|AUX)", r"\1_\2_AUX", line)
             line = re.sub("'ll_([^ \\_]+)'ll_[A-Z]+","_\\1_NOUN 'll_will_VERB",line)
             line = re.sub("([a-z]+)@l_([^ ]+)","\\1@l_\\1@l_NOUN",line)
             line = re.sub("([^ \\_]+)_([^ \\_]+)_NOUN 's\\_'s_PART","\\1's_\\1_NOUN",line)

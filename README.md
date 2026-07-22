@@ -5,9 +5,9 @@ Code for bootstrapping words into grammatical categories (NOUN/VERB) from a tagg
 ## Data
 
 - `manchester_input_tagged_trf_word_and_lemma.txt` — raw tagged Manchester corpus, one utterance per line, tokens in `WORD_LEMMA_TAG` format.
-- `manchester_input_tagged_trf_word_and_lemma_postprocessed.txt` — cleaned-up version produced by `from_tagged_corpus_to_seeds.py` (tag/lemma fixups, filler-word normalization, punctuation stripped). This is the file `category_bootstrap.py` actually reads.
-- `noun_selection.xlsx` / `verb_selection.xlsx` — candidate seed words with columns `Word`, `Count`, `Include` (1 = eligible to be used as a seed, 0 = excluded), also produced by `from_tagged_corpus_to_seeds.py`. Noun inclusion is decided via WordNet (`physical entity` hypernym check); verb inclusion is decided by human judgment, read from `verb_inclusion.xlsx`.
-- `verb_inclusion.xlsx` — human-curated verb inclusion judgments, columns `lemma`, `root`, `INCLUDE_wordnet`, `INCLUDE_human`. Every lemma here must occur in the corpus's verb list, or `from_tagged_corpus_to_seeds.py` raises an error.
+- `manchester_input_tagged_trf_word_and_lemma_postprocessed.txt` — cleaned-up version produced by `from_tagged_corpus_to_seeds.py` (tag/lemma fixups, filler-word normalization, punctuation stripped). This is the file `category_bootstrap.py` actually reads. `be`, `do`, and `have` are retagged away from `VERB` entirely here (blanket exclusion, covering both auxiliary and lexical/main-verb uses), so they never count as verbs anywhere downstream, including `all_tagged_nouns_verbs` mode (which reads tags directly).
+- `noun_selection.xlsx` / `verb_selection.xlsx` — candidate seed words with columns `Word`, `Count`, `Include` (1 = eligible to be used as a seed, 0 = excluded), also produced by `from_tagged_corpus_to_seeds.py`. Noun inclusion is decided via WordNet (`physical entity` hypernym check); verb inclusion is decided by human judgment, read from `verb_inclusion.xlsx`. Only consulted by the `require_tag_match_*` modes - `all_tagged_nouns_verbs` mode ignores these files entirely (see Modes below).
+- `verb_inclusion.xlsx` — human-curated verb inclusion judgments, columns `lemma`, `root`, `INCLUDE_wordnet`, `INCLUDE_human`. Every lemma here must occur in the corpus's verb list, or `from_tagged_corpus_to_seeds.py` raises an error. `be`/`do`/`have` are deliberately absent - since they're retagged away from `VERB` before this list is built, they'd otherwise trip that same-error check.
 
 ## Pipeline
 
@@ -30,8 +30,9 @@ It can be run two ways:
 
 Key concepts:
 
-- **Modes**: `all_tagged_nouns_verbs` (extract patterns from every corpus-tagged noun/verb, not just seeds), `require_tag_match_true` (a word only counts as a noun/verb seed if it's also tagged that way in the corpus), `require_tag_match_false` (seed list alone decides). The `require_tag_match_*` modes sweep across increasing seed-set sizes (smallest allowed by `--cum-prop-threshold`, doubling `--num-sweep-steps` times).
+- **Modes**: `all_tagged_nouns_verbs` (extract patterns from every word tagged noun/verb in the postprocessed training corpus itself - noun/verb status is decided purely from each occurrence's own corpus tag, and `noun_selection.xlsx`/`verb_selection.xlsx` are ignored entirely, not just for the noun/verb decision but for which words get used at all), `require_tag_match_true` (a word only counts as a noun/verb seed if it's also tagged that way in the corpus), `require_tag_match_false` (seed list alone decides). The `require_tag_match_*` modes sweep across increasing seed-set sizes (smallest allowed by `--cum-prop-threshold`, doubling `--num-sweep-steps` times).
 - **Pattern types**: `--pattern-type 1/2/3`, three different ways of defining the context window pattern around a target word.
+- **Punctuation**: punctuation tokens (anything with no letters, aside from the `{`/`}` sentence-boundary markers) are normalized to a single `PUNCT` placeholder before patterns are built, so e.g. `,` and `.` aren't treated as different context words. `PUNCT` can appear as a context slot in a learned pattern (e.g. `PUNCT_X_noun`), but a punctuation token is never used as the target/filler word (the `X` itself) - only real words (and the `NOUN`/`VERB` abstractions) can fill that position.
 - **Baseline**: every run also reports the score of a random-guess classifier, computed analytically (no simulation needed), for comparison. The guess probabilities come from self-classifying the training occurrences that built the run's own patterns (see `compute_pattern_guess_probs`) — e.g. if seed words occur 100 times in training and the model's patterns classify 10 of those as NOUN, 10 as VERB, and 80 as OTHER, the baseline guesses with probabilities 0.1/0.1/0.8, reflecting how decisive this particular pattern set is rather than the corpus's raw tag proportions. Those guesses are then scored against the actual test set.
 - **Corpus size**: `--corpus-size` randomly subsamples the corpus down to that many sentences instead of using the full corpus (deterministic given `--split-seed`). By default (`--subsample-scope train_only`) only the training pool is subsampled — the held-out test set is always the same fixed sentences regardless of corpus size, so results across different sizes are comparable against one fixed test set. `--subsample-scope whole_corpus` instead subsamples the full corpus before splitting, so the test set shrinks and changes between sizes too.
 
@@ -77,6 +78,12 @@ python3 category_bootstrap.py --merge --out-dir sweep_out
 ## Running the full comparison on a cluster
 
 The full mode × pattern-type comparison (3 pattern types × (1 `all_tagged_nouns_verbs` + `--num-sweep-steps` `require_tag_match_true` + `--num-sweep-steps` `require_tag_match_false`) runs — 39 jobs with the defaults) can be dispatched as many independent single-job processes instead of running sequentially in one process.
+
+Both cluster scripts run a preflight step before dispatching any jobs: by default (`REGENERATE_SEEDS=1`, the default) they rerun `from_tagged_corpus_to_seeds.py` to regenerate the postprocessed corpus and `noun_selection.csv`/`verb_selection.csv`, then refresh `noun_selection.xlsx`/`verb_selection.xlsx` from those `.csv` files - so a sweep never silently runs against a stale postprocessed corpus or seed list (e.g. after editing `from_tagged_corpus_to_seeds.py`'s tag cleanup rules or `verb_inclusion.xlsx`'s `Include` judgments). Set `REGENERATE_SEEDS=0` to skip this and dispatch against whatever's already on disk instead (useful if you've already regenerated things yourself, or want to avoid the network-dependent wordnet/`wn` lexicon download on every run). In `run_cluster_slurm.sh` this runs once on the submission host, before any `sbatch` call, since compute nodes may lack the network access the one-time wordnet/`wn` download needs.
+
+```
+REGENERATE_SEEDS=0 ./run_cluster.sh sweep_out 6 8
+```
 
 ### `run_cluster.sh` — local / any-scheduler parallel dispatch
 

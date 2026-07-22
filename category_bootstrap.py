@@ -14,10 +14,46 @@ from scipy import sparse
 import inspect
 
 
+_WORD_CHAR_RE = re.compile(r"[A-Za-z]")
+
+
+def _is_word_token(tok):
+    """
+    True if tok contains at least one letter, i.e. counts as an actual word
+    rather than punctuation, a sentence-boundary brace ("{"/"}"), or any
+    other non-alphabetic token. Abstracted tokens ("noun"/"verb") always
+    count as words.
+    """
+    return bool(_WORD_CHAR_RE.search(tok))
+
+
+def _is_word_context(tok):
+    """
+    True if tok is usable as a "real word" neighbor when deciding whether to
+    emit a context pattern - i.e. it is NOT the "PUNCT" placeholder and NOT a
+    sentence-boundary brace ("{"/"}"). Everything else (literal words, and
+    the "noun"/"verb" abstraction labels) counts as a word here, since those
+    always contain letters. Use this instead of _is_word_token on context
+    strings, because _is_word_token("PUNCT") would otherwise be True (it
+    contains letters) even though PUNCT stands in for a punctuation mark,
+    not a word.
+    """
+    return tok not in ("{", "}", "PUNCT")
+
+
 def extract_context_patterns_fast(corpus, seeds, window_size=2, dtype=np.int32, pattern_type=1,
                                    corpus_tags=None, require_tag_match=False,
-                                   all_tagged_nouns_verbs=False):
+                                   all_tagged_nouns_verbs=False, abstract_context=True):
     """
+    abstract_context:
+        True (default) - context words are abstracted to "noun"/"verb" when
+            they qualify per is_noun()/is_verb() (original behavior).
+        False - context words are left as their literal surface form; no
+            noun/verb abstraction is applied to context tokens. Only the
+            TARGET word's row label (NOUN/VERB/literal type) is unaffected
+            by this flag - abstraction of the target is controlled
+            separately and always applied.
+
     require_tag_match:
         False (default) - a word counts as a noun/verb whenever it appears in
             seeds['nouns']/seeds['verbs'], regardless of its corpus tag (original behavior).
@@ -72,7 +108,7 @@ def extract_context_patterns_fast(corpus, seeds, window_size=2, dtype=np.int32, 
     data = []
 
     for i, word in enumerate(corpus):
-        if word not in ["{" , "}"]:
+        if word not in ["{" , "}"] and _is_word_token(word):
             begin = max(i - window_size, 0)
             end = min(i + window_size, len(corpus) - 1)
             context_indices = list(range(begin, end + 1))
@@ -82,10 +118,20 @@ def extract_context_patterns_fast(corpus, seeds, window_size=2, dtype=np.int32, 
             context = []
             for idx in context_indices:
                 w = corpus[idx]
-                if is_verb(w, idx):
+                if abstract_context and is_verb(w, idx):
                     context.append("verb")
-                elif is_noun(w, idx):
+                elif abstract_context and is_noun(w, idx):
                     context.append("noun")
+                elif w in ("{", "}"):
+                    # sentence-boundary braces stay literal - the pattern
+                    # trimming regexes below look for these exact characters
+                    context.append(w)
+                elif not _is_word_token(w):
+                    # any other non-word token is punctuation - normalize all
+                    # punctuation marks to a single shared "PUNCT" label so
+                    # e.g. "," and "." aren't treated as different context
+                    # words, and so it's obvious PUNCT is not a real word
+                    context.append("PUNCT")
                 else:
                     context.append(w)
 
@@ -102,7 +148,12 @@ def extract_context_patterns_fast(corpus, seeds, window_size=2, dtype=np.int32, 
                 if pattern_type == 1:
                     p1 = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", context[1] + "_X_" + context[2]))
                     p1a = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", context[1] + "_X"))
-                    for p in (p1, p1a):
+                    candidates = []
+                    if _is_word_context(context[1]) or _is_word_context(context[2]):
+                        candidates.append(p1)
+                    if _is_word_context(context[1]):
+                        candidates.append(p1a)
+                    for p in candidates:
                         idx = context_to_idx.get(p)
                         if idx is None:
                             idx = len(contexts)
@@ -114,7 +165,12 @@ def extract_context_patterns_fast(corpus, seeds, window_size=2, dtype=np.int32, 
                 elif pattern_type == 2:
                     p2 = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", "X_" + context[2] + "_" + context[3]))
                     p2a = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", "X_" + context[2]))
-                    for p in (p2, p2a):
+                    candidates = []
+                    if _is_word_context(context[2]) or _is_word_context(context[3]):
+                        candidates.append(p2)
+                    if _is_word_context(context[2]):
+                        candidates.append(p2a)
+                    for p in candidates:
                         idx = context_to_idx.get(p)
                         if idx is None:
                             idx = len(contexts)
@@ -127,7 +183,12 @@ def extract_context_patterns_fast(corpus, seeds, window_size=2, dtype=np.int32, 
                     p3 = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", context[0] + "_" + context[1] + "_X"))
                     p3a = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", context[1] + "_X"))
 
-                    for p in (p3, p3a):
+                    candidates = []
+                    if _is_word_context(context[0]) or _is_word_context(context[1]):
+                        candidates.append(p3)
+                    if _is_word_context(context[1]):
+                        candidates.append(p3a)
+                    for p in candidates:
                         idx = context_to_idx.get(p)
                         if idx is None:
                             idx = len(contexts)
@@ -227,7 +288,7 @@ def run_extract_and_evaluate(
     target_prob_cutoff=0.0005,
     window_size=2, pattern_type=1,
     train_tags=None, require_tag_match=False,
-    all_tagged_nouns_verbs=False,
+    all_tagged_nouns_verbs=False, abstract_context=True,
 ):
     """
     Run extraction on train_tokens, categorize test_tokens (with test_tags),
@@ -245,6 +306,12 @@ def run_extract_and_evaluate(
         tagged noun/verb in the training corpus (per train_tags) is used to
         extract patterns, rather than only seed words. Requires train_tags
         and test_tags. Takes precedence over require_tag_match.
+
+    abstract_context: if False, context words are left as literal surface
+        forms instead of being abstracted to "noun"/"verb". Must be applied
+        consistently between pattern extraction (train) and categorization
+        (test) - see extract_context_patterns_fast and
+        categorize_with_contexts_fast.
     """
     seeds = {'nouns': selected_noun_seeds, 'verbs': selected_verb_seeds}
 
@@ -252,6 +319,7 @@ def run_extract_and_evaluate(
         train_tokens, seeds, window_size=window_size, pattern_type=pattern_type,
         corpus_tags=train_tags, require_tag_match=require_tag_match,
         all_tagged_nouns_verbs=all_tagged_nouns_verbs,
+        abstract_context=abstract_context,
     )
 
     # Baseline guess probabilities: how often THIS run's own patterns
@@ -264,6 +332,7 @@ def run_extract_and_evaluate(
         train_tokens, seeds, df_contexts, window_size=window_size, pattern_type=pattern_type,
         corpus_tags=train_tags, require_tag_match=require_tag_match,
         all_tagged_nouns_verbs=all_tagged_nouns_verbs,
+        abstract_context=abstract_context,
     )
 
     corpus_total = sum(token_counts.values())
@@ -282,6 +351,7 @@ def run_extract_and_evaluate(
         pattern_type=pattern_type,
         tags=test_tags,
         all_tagged_nouns_verbs=all_tagged_nouns_verbs,
+        abstract_context=abstract_context,
     )
 
     metrics = strict_precision_recall(results, guess_probs=guess_probs)
@@ -306,7 +376,7 @@ def categorize_with_contexts_fast(df, tokens, targets,
                                   selected_noun_seeds, selected_verb_seeds,
                                   sorted_noun_tokens, sorted_verb_tokens,
                                   window_size=2, tags=None, pattern_type=1,
-                                  all_tagged_nouns_verbs=False):
+                                  all_tagged_nouns_verbs=False, abstract_context=True):
     """
     all_tagged_nouns_verbs: when True, context words are marked "noun"/"verb"
     based on their own corpus tag (tags[idx] starting "N"/"V") instead of
@@ -314,6 +384,11 @@ def categorize_with_contexts_fast(df, tokens, targets,
     all_tagged_nouns_verbs mode, so patterns built that way at train time
     actually line up with contexts built at test/categorization time.
     Requires tags to be provided and aligned with tokens.
+
+    abstract_context: if False, context words are left as literal surface
+        forms (no noun/verb abstraction), matching
+        extract_context_patterns_fast's abstract_context=False mode. Must
+        match the setting used when the patterns in df were built.
     """
     if all_tagged_nouns_verbs and tags is None:
         raise ValueError("tags must be provided when all_tagged_nouns_verbs=True")
@@ -343,21 +418,29 @@ def categorize_with_contexts_fast(df, tokens, targets,
         context = []
         for idx in context_indices:
             w = tokens[idx]
-            if all_tagged_nouns_verbs:
+            # sentence-boundary braces stay literal (needed by the trimming
+            # regexes below); any other non-word token is punctuation and is
+            # normalized to "PUNCT" - must match extract_context_patterns_fast's
+            # normalization exactly, or patterns built at train time with
+            # "PUNCT" won't be found here at test time.
+            fallback = w if (w in ("{", "}") or _is_word_token(w)) else "PUNCT"
+            if not abstract_context:
+                context.append(fallback)
+            elif all_tagged_nouns_verbs:
                 # verb-first, matching extract_context_patterns_fast's priority
                 if re.match(r"^V", tags[idx]):
                     context.append("verb")
                 elif re.match(r"^N", tags[idx]):
                     context.append("noun")
                 else:
-                    context.append(w)
+                    context.append(fallback)
             else:
                 if w in selected_noun_set:
                     context.append("noun")
                 elif w in selected_verb_set:
                     context.append("verb")
                 else:
-                    context.append(w)
+                    context.append(fallback)
 
         if len(context) != 4:
             continue
@@ -405,7 +488,7 @@ def categorize_with_contexts_fast(df, tokens, targets,
 
 def compute_pattern_guess_probs(corpus, seeds, df, window_size=2, pattern_type=1,
                                  corpus_tags=None, require_tag_match=False,
-                                 all_tagged_nouns_verbs=False):
+                                 all_tagged_nouns_verbs=False, abstract_context=True):
     """
     Self-classification pass over the TRAINING corpus, used as the guess-
     probability source for the baseline instead of the training set's raw
@@ -478,10 +561,14 @@ def compute_pattern_guess_probs(corpus, seeds, df, window_size=2, pattern_type=1
         context = []
         for idx in context_indices:
             w = corpus[idx]
-            if is_verb(w, idx):
+            if abstract_context and is_verb(w, idx):
                 context.append("verb")
-            elif is_noun(w, idx):
+            elif abstract_context and is_noun(w, idx):
                 context.append("noun")
+            elif w in ("{", "}"):
+                context.append(w)
+            elif not _is_word_token(w):
+                context.append("PUNCT")
             else:
                 context.append(w)
 
@@ -609,6 +696,7 @@ def evaluate_single_run(
     token_counts, sorted_noun_tokens, sorted_verb_tokens,
     target_prob_cutoff=0.0005, window_size=2, pattern_type=1,
     train_tags=None, require_tag_match=False, all_tagged_nouns_verbs=False,
+    abstract_context=True,
     run_mode="run",
 ):
     """
@@ -635,6 +723,7 @@ def evaluate_single_run(
         pattern_type=pattern_type,
         train_tags=train_tags, require_tag_match=require_tag_match,
         all_tagged_nouns_verbs=all_tagged_nouns_verbs,
+        abstract_context=abstract_context,
     )
     t1 = time.time()
 
@@ -690,6 +779,7 @@ def sweep_and_save_runs(
     window_size=2, pattern_type=1,
     train_tags=None, require_tag_match=False,
     all_tagged_nouns_verbs=False,
+    abstract_context=True,
     force_full_seeds=False,
     max_sweep_steps=None,
     run_mode=None,
@@ -783,25 +873,38 @@ def sweep_and_save_runs(
             token_counts, sorted_noun_tokens, sorted_verb_tokens,
             target_prob_cutoff=target_prob_cutoff, window_size=window_size, pattern_type=pattern_type,
             train_tags=train_tags, require_tag_match=require_tag_match,
-            all_tagged_nouns_verbs=all_tagged_nouns_verbs, run_mode=run_mode,
+            all_tagged_nouns_verbs=all_tagged_nouns_verbs, abstract_context=abstract_context,
+            run_mode=run_mode,
         )
         _log(row, confusion_text, confusion_words, pattern_usage, num_nouns, num_verbs)
 
-    if all_tagged_nouns_verbs or force_full_seeds:
+    if all_tagged_nouns_verbs:
         # Single full pass, no sweep over increasing seed-list sizes.
+        # Noun/verb status in this mode is decided purely from each
+        # occurrence's own corpus tag (see extract_context_patterns_fast/
+        # categorize_with_contexts_fast's all_tagged_nouns_verbs branch,
+        # which bypasses seed-set membership entirely) - so the word list
+        # fed in here should be every word actually tagged noun/verb in the
+        # postprocessed training corpus, not the curated (Include==1) seed
+        # list. sorted_noun_tokens/sorted_verb_tokens are already exactly
+        # that (computed by load_corpus_and_split straight from the
+        # corpus's own tags).
+        selected_nouns = list(sorted_noun_tokens)
+        selected_verbs = list(sorted_verb_tokens)
+        # Seed-list sizes (total_noun/total_verb) would be a misleading
+        # thing to log here too - log the actual count of distinct
+        # noun-/verb-tagged word types found in the training corpus instead.
+        num_nouns_display, num_verbs_display = compute_all_tagged_counts(train_tokens, train_tags)
+        _run_and_log(selected_nouns, selected_verbs, num_nouns_display, num_verbs_display)
+        return summary_path, confusion_path
+
+    if force_full_seeds:
+        # Single full pass, no sweep over increasing seed-list sizes. Seeds
+        # ARE what's driving noun/verb status here, so use and log the
+        # actual full (Include==1) seed list/sizes.
         selected_nouns = noun_seeds_df['Word'].tolist()
         selected_verbs = verb_seeds_df['Word'].tolist()
-        if all_tagged_nouns_verbs:
-            # Seed identity is irrelevant in this mode - every tagged
-            # noun/verb in the training corpus is used - so the seed-list
-            # sizes (total_noun/total_verb) would be a misleading thing to
-            # log. Log the actual count of distinct noun-/verb-tagged word
-            # types found in the training corpus instead.
-            num_nouns_display, num_verbs_display = compute_all_tagged_counts(train_tokens, train_tags)
-        else:
-            # force_full_seeds: seeds ARE what's driving noun/verb status
-            # here, so log the actual full seed-list sizes used.
-            num_nouns_display, num_verbs_display = total_noun, total_verb
+        num_nouns_display, num_verbs_display = total_noun, total_verb
         _run_and_log(selected_nouns, selected_verbs, num_nouns_display, num_verbs_display)
         return summary_path, confusion_path
 
@@ -824,6 +927,7 @@ def run_mode_comparison(
     pattern_types=(1, 2, 3),
     train_tags=None,
     num_sweep_steps=6,
+    abstract_context=True,
 ):
     """
     For EACH pattern_type in pattern_types (all three by default), runs
@@ -859,7 +963,7 @@ def run_mode_comparison(
         token_counts=token_counts, sorted_noun_tokens=sorted_noun_tokens, sorted_verb_tokens=sorted_verb_tokens,
         out_dir=out_dir, cum_prop_threshold=cum_prop_threshold,
         target_prob_cutoff=target_prob_cutoff, window_size=window_size,
-        train_tags=train_tags,
+        train_tags=train_tags, abstract_context=abstract_context,
     )
 
     summary_path = confusion_path = None
@@ -1306,6 +1410,15 @@ def build_arg_parser():
     parser.add_argument("--num-sweep-steps", type=int, default=6)
     parser.add_argument("--cum-prop-threshold", type=float, default=0.1)
     parser.add_argument("--window-size", type=int, default=2)
+    parser.add_argument(
+        "--no-abstract-context", dest="abstract_context", action="store_false",
+        default=True,
+        help="Disable noun/verb abstraction of CONTEXT words - context tokens "
+             "are left as literal surface forms instead of being collapsed to "
+             "\"noun\"/\"verb\". Default is abstraction enabled (original "
+             "behavior). Target-word classification (NOUN/VERB row labels) is "
+             "unaffected.",
+    )
     parser.add_argument("--out-dir", default="sweep_out")
     parser.add_argument("--corpus-file", default="manchester_input_tagged_trf_word_and_lemma_postprocessed.txt")
     parser.add_argument("--noun-seeds-file", default="noun_selection.xlsx")
@@ -1374,6 +1487,7 @@ def main():
             num_sweep_steps=args.num_sweep_steps,
             cum_prop_threshold=args.cum_prop_threshold,
             window_size=args.window_size,
+            abstract_context=args.abstract_context,
         )
         print("summary written to", summary_csv)
         return
@@ -1389,11 +1503,12 @@ def main():
     os.makedirs(conf_parts_dir, exist_ok=True)
 
     if args.mode == "all_tagged_nouns_verbs":
-        _, noun_seeds_f, verb_seeds_f = compute_seed_steps(
-            noun_seeds, verb_seeds, cum_prop_threshold=args.cum_prop_threshold,
-        )
-        selected_nouns = noun_seeds_f['Word'].tolist()
-        selected_verbs = verb_seeds_f['Word'].tolist()
+        # Use every word tagged noun/verb in the postprocessed training
+        # corpus (already computed by load_corpus_and_split from the
+        # corpus's own tags), not the curated (Include==1) seed list - see
+        # the matching comment in run_extract_and_evaluate_sweep.
+        selected_nouns = list(sorted_noun_tokens)
+        selected_verbs = list(sorted_verb_tokens)
         num_nouns, num_verbs = compute_all_tagged_counts(train, train_tags)
         require_tag_match = False
         all_tagged = True
@@ -1423,7 +1538,8 @@ def main():
         token_counts, sorted_noun_tokens, sorted_verb_tokens,
         window_size=args.window_size, pattern_type=args.pattern_type,
         train_tags=train_tags, require_tag_match=require_tag_match,
-        all_tagged_nouns_verbs=all_tagged, run_mode=args.mode,
+        all_tagged_nouns_verbs=all_tagged, abstract_context=args.abstract_context,
+        run_mode=args.mode,
     )
 
     run_mode_safe = re.sub(r"[^A-Za-z0-9_-]+", "_", args.mode)

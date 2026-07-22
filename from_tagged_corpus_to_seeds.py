@@ -2,6 +2,7 @@ import nltk
 import wn
 import pandas as pd
 import re
+import time
 from collections import defaultdict
 
 lemma_file="manchester_input_tagged_trf_word_and_lemma.txt"
@@ -135,22 +136,35 @@ for i in range(verbs.shape[0]):
 verbs=verbs.merge(pd.DataFrame(d.items(),columns=["Word","Include"]),left_on='Word',right_on='Word')
 
 
+# This loop does one WordNet lookup + hypernym-path traversal per distinct
+# noun lemma in the corpus, which for a full-size corpus can be thousands of
+# lemmas and take a long time - print periodic progress so a long-running
+# job doesn't look hung with no output.
+num_nouns_to_check = nouns.shape[0]
+print(f"Checking WordNet ('physical entity' hypernym) inclusion for {num_nouns_to_check} candidate noun(s)...")
+noun_check_start = time.time()
+progress_every = max(1, num_nouns_to_check // 50) if num_nouns_to_check else 1
+
 d= defaultdict(int)
-for i in range(nouns.shape[0]):
+for i in range(num_nouns_to_check):
     lemma=str(nouns.iloc[i,0])
-    #print(lemma)
     syns =  en.synsets(lemma, pos='n')
-    #if len(syn) > 0:
     lem=[]
-    for this_syn in syns:    
+    for this_syn in syns:
       for path in wn.taxonomy.hypernym_paths(this_syn):
-         for i, ss in enumerate(path):
+         for _, ss in enumerate(path):
             lem.extend([l for l in ss.lemmas()])
 
     if ("physical entity" in lem):
         d[lemma] = 1
     else:
         d[lemma] = 0
+
+    if (i + 1) % progress_every == 0 or (i + 1) == num_nouns_to_check:
+        elapsed = time.time() - noun_check_start
+        print(f"  ...{i + 1}/{num_nouns_to_check} nouns checked ({elapsed:.0f}s elapsed)")
+
+print(f"WordNet noun inclusion check done in {time.time() - noun_check_start:.0f}s.")
 
 nouns=nouns.merge(pd.DataFrame(d.items(),columns=["Word","Include"]),left_on='Word',right_on='Word')
 

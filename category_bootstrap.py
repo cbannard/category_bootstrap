@@ -354,23 +354,35 @@ def run_extract_and_evaluate(
         abstract_context=abstract_context,
     )
 
-    metrics = strict_precision_recall(results, guess_probs=guess_probs)
+    metrics = strict_precision_recall(
+        results, guess_probs=guess_probs,
+        sorted_noun_tokens=sorted_noun_tokens, sorted_verb_tokens=sorted_verb_tokens,
+    )
     return metrics
 
 
 def get_max_count_item(this_pattern,df):
-    if this_pattern in df.columns:
-        #print(this_pattern)
-        counts = df[this_pattern]
-        max_count = counts.max()
-        # Find all categories with the max count
-        max_labels = [label for label, val in counts.items() if val == max_count and max_count > 0]
-        if len(max_labels) == 1:
-            return(max_labels[0])
-        else:
-            return("OTHER")
-    else:
+    if this_pattern not in df.columns:
         return None
+    counts = df[this_pattern]
+    max_count = counts.max()
+    if max_count <= 0:
+        # No occurrences of any type for this pattern - nothing to report.
+        return "OTHER"
+    # Find all categories with the max count
+    max_labels = [label for label, val in counts.items() if val == max_count]
+    if len(max_labels) == 1:
+        return max_labels[0]
+    else:
+        # Tie for the top (nonzero) count - no single winner, so report the
+        # identities of the tied types (e.g. "NOUN|VERB", or "cat|dog") instead
+        # of collapsing them into the uninformative literal string "OTHER".
+        # Callers that need a strict NOUN/VERB/OTHER split (scoring in
+        # categorize_with_contexts_fast/compute_pattern_guess_probs) already
+        # treat anything other than the exact strings "NOUN"/"VERB" as OTHER,
+        # so this is transparent to them - it only changes what shows up in
+        # human-facing output like pattern_usage's "predicted" column.
+        return "|".join(sorted(str(label) for label in max_labels))
 
 def categorize_with_contexts_fast(df, tokens, targets,
                                   selected_noun_seeds, selected_verb_seeds,
@@ -460,12 +472,18 @@ def categorize_with_contexts_fast(df, tokens, targets,
 
         # raw_pred is the un-collapsed winning label from get_max_count_item -
         # could be "NOUN"/"VERB", a specific corpus word (get_max_count_item
-        # can return any row label, not just NOUN/VERB), or the literal
-        # string "OTHER" (tie). used_pattern records which of the two
-        # patterns (primary or its short fallback) actually matched a column
-        # in the trained df - None if neither did, i.e. no trained pattern
-        # was actually used for this word (it fell through to OTHER for lack
-        # of any match at all).
+        # can return any row label, not just NOUN/VERB), a "|"-joined list of
+        # tied labels (e.g. "NOUN|VERB", "cat|dog") when there's no single
+        # training-time winner for this pattern, or the literal string
+        # "OTHER" itself when the pattern column had no occurrences at all.
+        # Whatever raw_pred is, `cat` below still collapses anything that
+        # isn't exactly "NOUN"/"VERB" to "OTHER" for scoring purposes - only
+        # human-facing output (e.g. pattern_usage's "predicted" column) shows
+        # the tied identities. used_pattern records which of the two patterns
+        # (primary or its short fallback) actually matched a column in the
+        # trained df - None if neither did, i.e. no trained pattern was
+        # actually used for this word (it fell through to OTHER for lack of
+        # any match at all).
         raw_pred = get_max_count_item(primary, df)
         used_pattern = primary
         if raw_pred is None:
@@ -1065,7 +1083,7 @@ def baseline_random_scores(true_mapped, guess_probs=None):
     }
 
 
-def strict_precision_recall(results, guess_probs=None):
+def strict_precision_recall(results, guess_probs=None, sorted_noun_tokens=None, sorted_verb_tokens=None):
     """
     Scoring per your rules:
       - map preds -> 'NOUN'/'VERB' else 'OTHER'
@@ -1080,8 +1098,21 @@ def strict_precision_recall(results, guess_probs=None):
     'confusion' matrix keeps the original OTHER column: rows are the actual
     corpus tags (PRON, DET, ADJ, NOUN, VERB, ...), not collapsed, but columns
     stay NOUN/VERB/OTHER. A separate, more granular breakdown is returned as
-    'confusion_words': same rows, but every word the categorizer didn't put
-    in NOUN/VERB gets its own column instead of being lumped into OTHER.
+    'confusion_words': same rows, plus 'NOUN'/'VERB' prediction columns as
+    before, but instead of one column per individual word the categorizer
+    didn't put in NOUN/VERB, there are three summary columns - 'item-noun',
+    'item-verb', 'item-neither' - each counting the total number of TOKEN
+    occurrences (not distinct word types) in that row that weren't predicted
+    NOUN/VERB, bucketed by that word's own primary tag in the training
+    corpus (from sorted_noun_tokens/sorted_verb_tokens - the same
+    majority-tag classification load_corpus_and_split uses elsewhere):
+    'item-noun' if the word is in sorted_noun_tokens, 'item-verb' if in
+    sorted_verb_tokens, 'item-neither' otherwise. sorted_noun_tokens/
+    sorted_verb_tokens are optional (default None, i.e. treated as empty -
+    everything falls into 'item-neither') so this remains callable without
+    them, but callers should pass the same lists used to build the
+    corresponding df_contexts/categorization, so the bucketing means what it
+    says.
     Also returns 'baseline': the scores a random guesser would get if it
     guessed NOUN/VERB/OTHER with probabilities guess_probs, scored against
     this run's actual test-set labels (see baseline_random_scores) - no
@@ -1094,8 +1125,11 @@ def strict_precision_recall(results, guess_probs=None):
     to classify a test-set word (not the full set of patterns extracted from
     training) - one row per pattern, with the number of times it was used,
     how many of those words were actually nouns/verbs in the test set (per
-    true_mapped), and the pattern's predicted output (a category or a
-    specific word, whichever get_max_count_item picked for that pattern).
+    true_mapped, as token occurrences: num_true_noun/num_true_verb) and how
+    many DISTINCT noun/verb word types those occurrences represent
+    (num_true_noun_types/num_true_verb_types), and the pattern's predicted
+    output (a category or a specific word, whichever get_max_count_item
+    picked for that pattern).
     Returns dict {per_class, micro, macro, confusion, confusion_words,
     baseline, pattern_usage}.
     """
@@ -1115,11 +1149,35 @@ def strict_precision_recall(results, guess_probs=None):
     # where predicted as such, else the literal word, so OTHER predictions
     # are broken out per word rather than collapsed into one column.
     df['pred_expanded'] = df['pred'].where(df['pred'].isin(['NOUN', 'VERB']), df['token'])
-    confusion_words = pd.crosstab(df['true'], df['pred_expanded'])
-    noun_verb_cols = [c for c in ('NOUN', 'VERB') if c in confusion_words.columns]
-    word_cols = [c for c in confusion_words.columns if c not in ('NOUN', 'VERB')]
-    word_cols = confusion_words[word_cols].sum(axis=0).sort_values(ascending=False).index.tolist()
-    confusion_words = confusion_words[noun_verb_cols + word_cols]
+    confusion_words_raw = pd.crosstab(df['true'], df['pred_expanded'])
+    noun_verb_cols = [c for c in ('NOUN', 'VERB') if c in confusion_words_raw.columns]
+    word_cols = [c for c in confusion_words_raw.columns if c not in ('NOUN', 'VERB')]
+
+    noun_set = set(sorted_noun_tokens or [])
+    verb_set = set(sorted_verb_tokens or [])
+
+    def _item_bucket(word):
+        if word in noun_set:
+            return 'item-noun'
+        elif word in verb_set:
+            return 'item-verb'
+        else:
+            return 'item-neither'
+
+    item_cols = ['item-noun', 'item-verb', 'item-neither']
+    confusion_words = confusion_words_raw[noun_verb_cols].copy()
+    if word_cols:
+        # Sum raw token-occurrence counts (not distinct word types) per
+        # bucket - confusion_words_raw[w] for a given row is how many
+        # occurrences of word w had that true tag.
+        buckets_by_word = {w: _item_bucket(w) for w in word_cols}
+        for bucket in item_cols:
+            cols_in_bucket = [w for w in word_cols if buckets_by_word[w] == bucket]
+            confusion_words[bucket] = confusion_words_raw[cols_in_bucket].sum(axis=1) if cols_in_bucket else 0
+    else:
+        for bucket in item_cols:
+            confusion_words[bucket] = 0
+
     confusion_words = confusion_words.loc[confusion_words.sum(axis=1).sort_values(ascending=False).index]
 
     # Collapsed confusion matrix, used only to compute precision/recall/F1.
@@ -1167,6 +1225,10 @@ def strict_precision_recall(results, guess_probs=None):
     # neither the primary nor fallback pattern matched any trained column at
     # all (nothing to report there, so those rows are excluded).
     used_df = df[df['used_pattern'].notna()]
+    pattern_usage_cols = [
+        'uses', 'num_true_noun', 'num_true_verb',
+        'num_true_noun_types', 'num_true_verb_types', 'predicted',
+    ]
     if len(used_df) > 0:
         pattern_usage = used_df.groupby('used_pattern').agg(
             uses=('used_pattern', 'size'),
@@ -1174,12 +1236,25 @@ def strict_precision_recall(results, guess_probs=None):
             num_true_verb=('true_mapped', lambda s: int((s == 'VERB').sum())),
             predicted=('raw_pred', 'first'),
         )
+        # num_true_noun/num_true_verb above count TOKEN occurrences; these
+        # count DISTINCT word types among them instead - e.g. if a pattern
+        # was used for "cat" three times and "dog" once, all as true nouns,
+        # num_true_noun=4 but num_true_noun_types=2.
+        noun_type_counts = (
+            used_df[used_df['true_mapped'] == 'NOUN']
+            .groupby('used_pattern')['token'].nunique()
+        )
+        verb_type_counts = (
+            used_df[used_df['true_mapped'] == 'VERB']
+            .groupby('used_pattern')['token'].nunique()
+        )
+        pattern_usage['num_true_noun_types'] = noun_type_counts.reindex(pattern_usage.index, fill_value=0).astype(int)
+        pattern_usage['num_true_verb_types'] = verb_type_counts.reindex(pattern_usage.index, fill_value=0).astype(int)
+        pattern_usage = pattern_usage[pattern_usage_cols]
         pattern_usage.index.name = 'pattern'
         pattern_usage = pattern_usage.sort_values('uses', ascending=False)
     else:
-        pattern_usage = pd.DataFrame(
-            columns=['uses', 'num_true_noun', 'num_true_verb', 'predicted']
-        ).rename_axis('pattern')
+        pattern_usage = pd.DataFrame(columns=pattern_usage_cols).rename_axis('pattern')
 
     print(detailed_confusion)
     return {

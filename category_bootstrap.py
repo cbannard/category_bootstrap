@@ -41,10 +41,22 @@ def _is_word_context(tok):
     return tok not in ("{", "}", "PUNCT")
 
 
-def extract_context_patterns_fast(corpus, seeds, window_size=2, dtype=np.int32, pattern_type=1,
+def extract_context_patterns_fast(corpus, seeds, corpus_words=None, window_size=2, dtype=np.int32, pattern_type=1,
                                    corpus_tags=None, require_tag_match=False,
                                    all_tagged_nouns_verbs=False, abstract_context=True):
     """
+    corpus: the LEMMA sequence - used only to match seeds to tokens (is_noun/
+        is_verb membership against seeds['nouns']/seeds['verbs'], and the
+        require_tag_match/all_tagged_nouns_verbs per-occurrence tag checks).
+
+    corpus_words: the SURFACE WORD FORM sequence, aligned index-for-index
+        with corpus. This is what actually gets used to build pattern text
+        and to record the lexical filler for a target/context word that
+        isn't abstracted to "noun"/"verb" - i.e. everywhere this function
+        used to write a literal word into a pattern or a df_contexts row
+        label, it now writes the surface form instead of the lemma. Required
+        (must be the same length as corpus).
+
     abstract_context:
         True (default) - context words are abstracted to "noun"/"verb" when
             they qualify per is_noun()/is_verb() (original behavior).
@@ -74,8 +86,15 @@ def extract_context_patterns_fast(corpus, seeds, window_size=2, dtype=np.int32, 
         raise ValueError("corpus_tags must be provided when require_tag_match=True or all_tagged_nouns_verbs=True")
     if (require_tag_match or all_tagged_nouns_verbs) and len(corpus_tags) != len(corpus):
         raise ValueError("corpus_tags must be the same length as corpus")
+    if corpus_words is None:
+        raise ValueError("corpus_words (surface word forms) must be provided")
+    if len(corpus_words) != len(corpus):
+        raise ValueError("corpus_words must be the same length as corpus")
 
-    types = sorted(set(corpus))
+    # Row/type universe is the surface word forms (plus NOUN/VERB) - a
+    # target/context word that isn't abstracted to noun/verb is recorded
+    # under its literal surface form, not its lemma.
+    types = sorted(set(corpus_words))
     types.extend(["NOUN", "VERB"])
     types_to_idx = {t: i for i, t in enumerate(types)}
 
@@ -108,42 +127,47 @@ def extract_context_patterns_fast(corpus, seeds, window_size=2, dtype=np.int32, 
     data = []
 
     for i, word in enumerate(corpus):
-        if word not in ["{" , "}"] and _is_word_token(word):
+        word_form = corpus_words[i]
+        if word_form not in ("{", "}") and _is_word_token(word_form):
             begin = max(i - window_size, 0)
             end = min(i + window_size, len(corpus) - 1)
             context_indices = list(range(begin, end + 1))
             del context_indices[i-begin]
 
-            # verb membership takes priority over noun on overlap
+            # verb membership takes priority over noun on overlap. Note:
+            # is_verb/is_noun match on the LEMMA (w); the literal fallback
+            # text uses the surface form (w_form) instead.
             context = []
             for idx in context_indices:
                 w = corpus[idx]
+                w_form = corpus_words[idx]
                 if abstract_context and is_verb(w, idx):
                     context.append("verb")
                 elif abstract_context and is_noun(w, idx):
                     context.append("noun")
-                elif w in ("{", "}"):
+                elif w_form in ("{", "}"):
                     # sentence-boundary braces stay literal - the pattern
                     # trimming regexes below look for these exact characters
-                    context.append(w)
-                elif not _is_word_token(w):
+                    context.append(w_form)
+                elif not _is_word_token(w_form):
                     # any other non-word token is punctuation - normalize all
                     # punctuation marks to a single shared "PUNCT" label so
                     # e.g. "," and "." aren't treated as different context
                     # words, and so it's obvious PUNCT is not a real word
                     context.append("PUNCT")
                 else:
-                    context.append(w)
+                    context.append(w_form)
 
             if len(context) == 4:
-                # noun membership takes priority over verb on overlap
-                
+                # noun membership takes priority over verb on overlap. As
+                # above, is_noun/is_verb match on the lemma (word); the
+                # literal-filler fallback uses the surface form (word_form).
                 if is_noun(word, i):
                     seed_id = types_to_idx["NOUN"]
                 elif is_verb(word, i):
                     seed_id = types_to_idx["VERB"]
                 else:
-                    seed_id = types_to_idx[word]
+                    seed_id = types_to_idx[word_form]
 
                 if pattern_type == 1:
                     p1 = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", context[1] + "_X_" + context[2]))
@@ -285,6 +309,9 @@ def run_extract_and_evaluate(
     token_counts,
     sorted_noun_tokens,
     sorted_verb_tokens,
+    train_words=None,
+    test_words=None,
+    word_primary_tag=None,
     target_prob_cutoff=0.0005,
     window_size=2, pattern_type=1,
     train_tags=None, require_tag_match=False,
@@ -297,6 +324,15 @@ def run_extract_and_evaluate(
     - results: list of (token, pred, true_tag) tuples from categorize_with_contexts_fast
     - metrics: output of strict_precision_recall(results)
     - df_contexts: DataFrame from extract_context_patterns_fast
+
+    train_tokens/test_tokens: the LEMMA sequences - used only for seed
+    matching (is_noun/is_verb membership checks). train_words/test_words:
+    the aligned surface WORD FORM sequences - used for pattern text and for
+    the lexical filler recorded for a target/context word. Required.
+
+    word_primary_tag: {surface word form -> its most frequent corpus tag},
+    from load_corpus_and_split - passed straight through to
+    strict_precision_recall for confusion_words' item-<pos> breakdown.
 
     require_tag_match: if True, a training-corpus word only counts as a noun/verb
         when it is also tagged as that category in train_tags (see
@@ -313,10 +349,13 @@ def run_extract_and_evaluate(
         (test) - see extract_context_patterns_fast and
         categorize_with_contexts_fast.
     """
+    if train_words is None or test_words is None:
+        raise ValueError("train_words and test_words (surface word forms) must be provided")
+
     seeds = {'nouns': selected_noun_seeds, 'verbs': selected_verb_seeds}
 
     df_contexts = extract_context_patterns_fast(
-        train_tokens, seeds, window_size=window_size, pattern_type=pattern_type,
+        train_tokens, seeds, corpus_words=train_words, window_size=window_size, pattern_type=pattern_type,
         corpus_tags=train_tags, require_tag_match=require_tag_match,
         all_tagged_nouns_verbs=all_tagged_nouns_verbs,
         abstract_context=abstract_context,
@@ -329,19 +368,29 @@ def run_extract_and_evaluate(
     # the test set's own frequency) if there were no such occurrences at
     # all (e.g. an empty seed list).
     guess_probs = compute_pattern_guess_probs(
-        train_tokens, seeds, df_contexts, window_size=window_size, pattern_type=pattern_type,
+        train_tokens, seeds, df_contexts, corpus_words=train_words, window_size=window_size, pattern_type=pattern_type,
         corpus_tags=train_tags, require_tag_match=require_tag_match,
         all_tagged_nouns_verbs=all_tagged_nouns_verbs,
         abstract_context=abstract_context,
     )
 
+    # token_counts is keyed by surface word form (see load_corpus_and_split),
+    # so targets below - the words rare enough to attempt classifying at all -
+    # are surface forms too. token_counts includes punctuation marks (their
+    # own literal surface form, e.g. "." or ",", not yet normalized to
+    # "PUNCT" - that normalization only happens inside pattern/context
+    # building) alongside real words, so exclude anything that isn't a word
+    # (_is_word_token) here - predictions should only ever be attempted for
+    # actual words, never punctuation (or the sentence-boundary braces,
+    # which token_counts doesn't contain anyway).
     corpus_total = sum(token_counts.values())
     token_probs = {k: (v / corpus_total) for k, v in token_counts.items()}
-    targets = [k for k, p in token_probs.items() if p < target_prob_cutoff]
+    targets = [k for k, p in token_probs.items() if p < target_prob_cutoff and _is_word_token(k)]
 
     results = categorize_with_contexts_fast(
         df_contexts,
         test_tokens,
+        test_words,
         targets,
         selected_noun_seeds,
         selected_verb_seeds,
@@ -357,6 +406,7 @@ def run_extract_and_evaluate(
     metrics = strict_precision_recall(
         results, guess_probs=guess_probs,
         sorted_noun_tokens=sorted_noun_tokens, sorted_verb_tokens=sorted_verb_tokens,
+        word_primary_tag=word_primary_tag,
     )
     return metrics
 
@@ -384,31 +434,53 @@ def get_max_count_item(this_pattern,df):
         # human-facing output like pattern_usage's "predicted" column.
         return "|".join(sorted(str(label) for label in max_labels))
 
-def categorize_with_contexts_fast(df, tokens, targets,
+def categorize_with_contexts_fast(df, tokens, word_forms, targets,
                                   selected_noun_seeds, selected_verb_seeds,
                                   sorted_noun_tokens, sorted_verb_tokens,
                                   window_size=2, tags=None, pattern_type=1,
                                   all_tagged_nouns_verbs=False, abstract_context=True):
     """
+    tokens: the LEMMA sequence for the corpus being categorized - used only
+        to match context words against selected_noun_seeds/selected_verb_seeds
+        (the same lemma-based seed-matching extract_context_patterns_fast
+        uses at train time).
+
+    word_forms: the SURFACE WORD FORM sequence, aligned index-for-index with
+        tokens. This drives target-word iteration/eligibility (targets_set
+        membership) and is what's recorded as the classified word's identity
+        in the returned results, and it's what fills in a context word's
+        literal (non-abstracted) pattern text - i.e. everywhere this
+        function used to use the lemma for a literal identity/pattern text,
+        it now uses the surface form instead. Required.
+
+    A target is only ever an actual word - punctuation is never classified,
+    enforced here directly via _is_word_token (not just by relying on the
+    caller's `targets` list already excluding it - see run_extract_and_evaluate),
+    mirroring the same target-eligibility check extract_context_patterns_fast
+    applies when learning patterns.
+
     all_tagged_nouns_verbs: when True, context words are marked "noun"/"verb"
     based on their own corpus tag (tags[idx] starting "N"/"V") instead of
     seed-list membership - mirrors extract_context_patterns_fast's
     all_tagged_nouns_verbs mode, so patterns built that way at train time
     actually line up with contexts built at test/categorization time.
-    Requires tags to be provided and aligned with tokens.
+    Requires tags to be provided and aligned with tokens/word_forms.
 
     abstract_context: if False, context words are left as literal surface
         forms (no noun/verb abstraction), matching
         extract_context_patterns_fast's abstract_context=False mode. Must
         match the setting used when the patterns in df were built.
     """
+    if word_forms is None:
+        raise ValueError("word_forms (surface word forms) must be provided")
+    if len(word_forms) != len(tokens):
+        raise ValueError("word_forms must be the same length as tokens")
     if all_tagged_nouns_verbs and tags is None:
         raise ValueError("tags must be provided when all_tagged_nouns_verbs=True")
     if all_tagged_nouns_verbs and len(tags) != len(tokens):
         raise ValueError("tags must be the same length as tokens")
 
-    toks_to_ignore = {"{", "}"}
-    token_count = len(tokens)
+    token_count = len(word_forms)
     #print("CALLED!")
     #print(tags)
     selected_noun_set = set(selected_noun_seeds)
@@ -418,8 +490,13 @@ def categorize_with_contexts_fast(df, tokens, targets,
 
     results = []
     trim = _trim_braces_fast
-    for i, word in enumerate(tokens):
-        if word.lower() in toks_to_ignore or word.lower() not in targets_set:
+    for i, word in enumerate(word_forms):
+        # A target must be an actual word: not a sentence-boundary brace,
+        # and not punctuation (_is_word_token requires at least one letter -
+        # punctuation marks like "." or "," have none). Checked here
+        # directly, not just via targets_set membership, so this holds even
+        # if a caller's targets list wasn't already filtered this way.
+        if word in ("{", "}") or not _is_word_token(word) or word.lower() not in targets_set:
             continue
 
         begin = max(i - window_size, 0)
@@ -429,13 +506,14 @@ def categorize_with_contexts_fast(df, tokens, targets,
 
         context = []
         for idx in context_indices:
-            w = tokens[idx]
+            w_lemma = tokens[idx]
+            w_form = word_forms[idx]
             # sentence-boundary braces stay literal (needed by the trimming
             # regexes below); any other non-word token is punctuation and is
             # normalized to "PUNCT" - must match extract_context_patterns_fast's
             # normalization exactly, or patterns built at train time with
             # "PUNCT" won't be found here at test time.
-            fallback = w if (w in ("{", "}") or _is_word_token(w)) else "PUNCT"
+            fallback = w_form if (w_form in ("{", "}") or _is_word_token(w_form)) else "PUNCT"
             if not abstract_context:
                 context.append(fallback)
             elif all_tagged_nouns_verbs:
@@ -447,9 +525,9 @@ def categorize_with_contexts_fast(df, tokens, targets,
                 else:
                     context.append(fallback)
             else:
-                if w in selected_noun_set:
+                if w_lemma in selected_noun_set:
                     context.append("noun")
-                elif w in selected_verb_set:
+                elif w_lemma in selected_verb_set:
                     context.append("verb")
                 else:
                     context.append(fallback)
@@ -504,13 +582,18 @@ def categorize_with_contexts_fast(df, tokens, targets,
     return results
 
 
-def compute_pattern_guess_probs(corpus, seeds, df, window_size=2, pattern_type=1,
+def compute_pattern_guess_probs(corpus, seeds, df, corpus_words=None, window_size=2, pattern_type=1,
                                  corpus_tags=None, require_tag_match=False,
                                  all_tagged_nouns_verbs=False, abstract_context=True):
     """
     Self-classification pass over the TRAINING corpus, used as the guess-
     probability source for the baseline instead of the training set's raw
     tag frequency.
+
+    corpus/corpus_words: as in extract_context_patterns_fast - corpus is the
+    LEMMA sequence (used for is_noun/is_verb seed matching), corpus_words is
+    the aligned surface WORD FORM sequence (used for literal pattern text),
+    required and must be the same length as corpus.
 
     For every training-corpus occurrence where the target word is itself a
     noun/verb by this run's own criteria (seeds/require_tag_match/
@@ -532,6 +615,10 @@ def compute_pattern_guess_probs(corpus, seeds, df, window_size=2, pattern_type=1
     """
     if (require_tag_match or all_tagged_nouns_verbs) and corpus_tags is None:
         raise ValueError("corpus_tags must be provided when require_tag_match=True or all_tagged_nouns_verbs=True")
+    if corpus_words is None:
+        raise ValueError("corpus_words (surface word forms) must be provided")
+    if len(corpus_words) != len(corpus):
+        raise ValueError("corpus_words must be the same length as corpus")
 
     seeds = seeds or {}
     noun_set = set(seeds.get('nouns', []))
@@ -579,16 +666,17 @@ def compute_pattern_guess_probs(corpus, seeds, df, window_size=2, pattern_type=1
         context = []
         for idx in context_indices:
             w = corpus[idx]
+            w_form = corpus_words[idx]
             if abstract_context and is_verb(w, idx):
                 context.append("verb")
             elif abstract_context and is_noun(w, idx):
                 context.append("noun")
-            elif w in ("{", "}"):
-                context.append(w)
-            elif not _is_word_token(w):
+            elif w_form in ("{", "}"):
+                context.append(w_form)
+            elif not _is_word_token(w_form):
                 context.append("PUNCT")
             else:
-                context.append(w)
+                context.append(w_form)
 
         if len(context) != 4:
             continue
@@ -634,18 +722,20 @@ SUMMARY_COLS = [
 ]
 
 
-def compute_all_tagged_counts(train_tokens, train_tags):
+def compute_all_tagged_counts(train_words, train_tags):
     """
     Returns (num_nouns, num_verbs): the count of distinct noun-/verb-tagged
-    word types in the training corpus (per train_tags) - what
+    surface WORD FORMS in the training corpus (per train_tags) - what
     all_tagged_nouns_verbs=True actually uses instead of a seed list. Used
     both by sweep_and_save_runs and the standalone single-run CLI mode, so
-    that mode logs a meaningful "how many nouns/verbs" number.
+    that mode logs a meaningful "how many nouns/verbs" number. Takes
+    train_words (surface form), not the lemma array, so this lines up with
+    the rest of the pipeline's word-form-based reporting.
     """
     if train_tags is None:
         raise ValueError("train_tags must be provided for all_tagged_nouns_verbs mode")
-    actual_nouns = {w for w, t in zip(train_tokens, train_tags) if re.match(r"^N", t)}
-    actual_verbs = {w for w, t in zip(train_tokens, train_tags) if re.match(r"^V", t)}
+    actual_nouns = {w for w, t in zip(train_words, train_tags) if re.match(r"^N", t)}
+    actual_verbs = {w for w, t in zip(train_words, train_tags) if re.match(r"^V", t)}
     return len(actual_nouns), len(actual_verbs)
 
 
@@ -712,6 +802,7 @@ def evaluate_single_run(
     run_fn, train_tokens, test_tokens, test_tags,
     selected_nouns, selected_verbs, num_nouns, num_verbs,
     token_counts, sorted_noun_tokens, sorted_verb_tokens,
+    train_words=None, test_words=None, word_primary_tag=None,
     target_prob_cutoff=0.0005, window_size=2, pattern_type=1,
     train_tags=None, require_tag_match=False, all_tagged_nouns_verbs=False,
     abstract_context=True,
@@ -737,6 +828,7 @@ def evaluate_single_run(
         train_tokens, test_tokens, test_tags,
         selected_nouns, selected_verbs,
         token_counts, sorted_noun_tokens, sorted_verb_tokens,
+        train_words=train_words, test_words=test_words, word_primary_tag=word_primary_tag,
         target_prob_cutoff=target_prob_cutoff, window_size=window_size,
         pattern_type=pattern_type,
         train_tags=train_tags, require_tag_match=require_tag_match,
@@ -791,6 +883,7 @@ def sweep_and_save_runs(
     run_fn, train_tokens, test_tokens, test_tags,
     noun_seeds_df, verb_seeds_df,
     token_counts, sorted_noun_tokens, sorted_verb_tokens,
+    train_words=None, test_words=None, word_primary_tag=None,
     out_dir="sweep_runs",
     cum_prop_threshold=0.1,
     target_prob_cutoff=0.0005,
@@ -889,6 +982,7 @@ def sweep_and_save_runs(
             run_fn, train_tokens, test_tokens, test_tags,
             selected_nouns, selected_verbs, num_nouns, num_verbs,
             token_counts, sorted_noun_tokens, sorted_verb_tokens,
+            train_words=train_words, test_words=test_words, word_primary_tag=word_primary_tag,
             target_prob_cutoff=target_prob_cutoff, window_size=window_size, pattern_type=pattern_type,
             train_tags=train_tags, require_tag_match=require_tag_match,
             all_tagged_nouns_verbs=all_tagged_nouns_verbs, abstract_context=abstract_context,
@@ -906,13 +1000,13 @@ def sweep_and_save_runs(
         # postprocessed training corpus, not the curated (Include==1) seed
         # list. sorted_noun_tokens/sorted_verb_tokens are already exactly
         # that (computed by load_corpus_and_split straight from the
-        # corpus's own tags).
+        # corpus's own tags, and now surface-form-based).
         selected_nouns = list(sorted_noun_tokens)
         selected_verbs = list(sorted_verb_tokens)
         # Seed-list sizes (total_noun/total_verb) would be a misleading
         # thing to log here too - log the actual count of distinct
         # noun-/verb-tagged word types found in the training corpus instead.
-        num_nouns_display, num_verbs_display = compute_all_tagged_counts(train_tokens, train_tags)
+        num_nouns_display, num_verbs_display = compute_all_tagged_counts(train_words, train_tags)
         _run_and_log(selected_nouns, selected_verbs, num_nouns_display, num_verbs_display)
         return summary_path, confusion_path
 
@@ -938,6 +1032,7 @@ def run_mode_comparison(
     run_fn, train_tokens, test_tokens, test_tags,
     noun_seeds_df, verb_seeds_df,
     token_counts, sorted_noun_tokens, sorted_verb_tokens,
+    train_words=None, test_words=None, word_primary_tag=None,
     out_dir="sweep_runs",
     cum_prop_threshold=0.1,
     target_prob_cutoff=0.0005,
@@ -979,6 +1074,7 @@ def run_mode_comparison(
         run_fn=run_fn, train_tokens=train_tokens, test_tokens=test_tokens, test_tags=test_tags,
         noun_seeds_df=noun_seeds_df, verb_seeds_df=verb_seeds_df,
         token_counts=token_counts, sorted_noun_tokens=sorted_noun_tokens, sorted_verb_tokens=sorted_verb_tokens,
+        train_words=train_words, test_words=test_words, word_primary_tag=word_primary_tag,
         out_dir=out_dir, cum_prop_threshold=cum_prop_threshold,
         target_prob_cutoff=target_prob_cutoff, window_size=window_size,
         train_tags=train_tags, abstract_context=abstract_context,
@@ -1083,7 +1179,43 @@ def baseline_random_scores(true_mapped, guess_probs=None):
     }
 
 
-def strict_precision_recall(results, guess_probs=None, sorted_noun_tokens=None, sorted_verb_tokens=None):
+
+# Friendly names for the Universal-Dependencies-style POS tags this pipeline's
+# corpus uses (after from_tagged_corpus_to_seeds.py's cleanup - PROPN folded
+# into NOUN, AUX kept distinct from VERB, etc.), used only to build readable
+# 'item-<pos>' column names in confusion_words below. Any tag not listed here
+# (e.g. a tagset this pipeline hasn't seen yet) still works - it just falls
+# back to the tag lowercased as-is, so this table never needs to be
+# exhaustive to avoid an error, only to make the common cases read nicely.
+# PUNCT/BOS/EOS are deliberately NOT here - see _NON_WORD_ITEM_TAGS below,
+# punctuation/sentence-boundary markers never get their own item-<pos>
+# column since predictions are never made for them in the first place (see
+# the _is_word_token filter on `targets` in run_extract_and_evaluate).
+POS_ITEM_COLUMN_NAMES = {
+    'NOUN': 'noun', 'PROPN': 'proper-noun', 'VERB': 'verb', 'AUX': 'auxiliary',
+    'ADJ': 'adjective', 'ADV': 'adverb', 'DET': 'determiner', 'PRON': 'pronoun',
+    'ADP': 'adposition', 'CCONJ': 'conjunction', 'CONJ': 'conjunction',
+    'SCONJ': 'subordinating-conjunction', 'NUM': 'numeral', 'PART': 'particle',
+    'INTJ': 'interjection', 'SYM': 'symbol', 'X': 'other',
+}
+
+# Tags that should never produce their own item-<pos> column, even if a word
+# with this as its primary tag somehow ends up in confusion_words - real
+# words are never classified as PUNCT/BOS/EOS overall (predictions are only
+# ever attempted for actual words - see _is_word_token), so a word landing
+# here would indicate something upstream let punctuation/a boundary marker
+# through as a target; fall back to 'item-neither' rather than normalizing
+# that with a dedicated column.
+_NON_WORD_ITEM_TAGS = {'PUNCT', 'BOS', 'EOS'}
+
+
+def _pos_item_col(tag):
+    """'item-<pos>' column name for a given corpus tag, e.g. 'ADJ' -> 'item-adjective'."""
+    return f"item-{POS_ITEM_COLUMN_NAMES.get(tag, tag.lower())}"
+
+
+def strict_precision_recall(results, guess_probs=None, sorted_noun_tokens=None,
+                             sorted_verb_tokens=None, word_primary_tag=None):
     """
     Scoring per your rules:
       - map preds -> 'NOUN'/'VERB' else 'OTHER'
@@ -1100,19 +1232,28 @@ def strict_precision_recall(results, guess_probs=None, sorted_noun_tokens=None, 
     stay NOUN/VERB/OTHER. A separate, more granular breakdown is returned as
     'confusion_words': same rows, plus 'NOUN'/'VERB' prediction columns as
     before, but instead of one column per individual word the categorizer
-    didn't put in NOUN/VERB, there are three summary columns - 'item-noun',
-    'item-verb', 'item-neither' - each counting the total number of TOKEN
-    occurrences (not distinct word types) in that row that weren't predicted
-    NOUN/VERB, bucketed by that word's own primary tag in the training
-    corpus (from sorted_noun_tokens/sorted_verb_tokens - the same
-    majority-tag classification load_corpus_and_split uses elsewhere):
-    'item-noun' if the word is in sorted_noun_tokens, 'item-verb' if in
-    sorted_verb_tokens, 'item-neither' otherwise. sorted_noun_tokens/
-    sorted_verb_tokens are optional (default None, i.e. treated as empty -
-    everything falls into 'item-neither') so this remains callable without
-    them, but callers should pass the same lists used to build the
-    corresponding df_contexts/categorization, so the bucketing means what it
-    says.
+    didn't put in NOUN/VERB, there are 'item-<pos>' summary columns - always
+    including 'item-noun', 'item-verb', plus one additional column per other
+    part of speech actually present (e.g. 'item-adjective', 'item-determiner',
+    'item-auxiliary') - each counting the total number of TOKEN occurrences
+    (not distinct word types) in that row that weren't predicted NOUN/VERB,
+    bucketed by that word's own primary tag in the training corpus:
+      - 'item-noun' if the word is in sorted_noun_tokens, 'item-verb' if in
+        sorted_verb_tokens (the same majority-tag - N-count vs V-count -
+        classification load_corpus_and_split uses elsewhere for these two
+        categories specifically);
+      - otherwise, 'item-<pos>' for whatever that word's single most
+        frequent corpus tag is (from word_primary_tag, a full argmax over
+        every tag the word was ever seen with - see load_corpus_and_split),
+        via the POS_ITEM_COLUMN_NAMES friendly-name table above.
+    There's no catch-all 'item-neither' column - every real word that can
+    reach this point has a primary tag (word_primary_tag is built from the
+    same corpus scan as everything else), so it always lands in one of the
+    columns above. sorted_noun_tokens/sorted_verb_tokens/word_primary_tag
+    are all optional (default None, i.e. treated as empty) so this remains
+    callable without them, but callers should pass the same data used to
+    build the corresponding df_contexts/categorization, so the bucketing
+    means what it says.
     Also returns 'baseline': the scores a random guesser would get if it
     guessed NOUN/VERB/OTHER with probabilities guess_probs, scored against
     this run's actual test-set labels (see baseline_random_scores) - no
@@ -1155,26 +1296,56 @@ def strict_precision_recall(results, guess_probs=None, sorted_noun_tokens=None, 
 
     noun_set = set(sorted_noun_tokens or [])
     verb_set = set(sorted_verb_tokens or [])
+    word_primary_tag = word_primary_tag or {}
 
     def _item_bucket(word):
         if word in noun_set:
             return 'item-noun'
         elif word in verb_set:
             return 'item-verb'
-        else:
-            return 'item-neither'
+        tag = word_primary_tag.get(word)
+        if tag and tag not in _NON_WORD_ITEM_TAGS:
+            # Whatever this word's actual majority tag is - if that happens
+            # to be NOUN/VERB (a word sorted_noun_tokens/sorted_verb_tokens'
+            # N-count-vs-V-count comparison didn't catch, e.g. a near-tie),
+            # _pos_item_col naturally produces 'item-noun'/'item-verb' too,
+            # merging into the same column rather than needing a special case.
+            return _pos_item_col(tag)
+        # Every real word should be covered by one of the branches above -
+        # word_primary_tag is built from the same corpus scan as everything
+        # else, and punctuation/boundary markers (_NON_WORD_ITEM_TAGS) are
+        # already excluded from ever being a classification target upstream
+        # (see the _is_word_token guards in extract_context_patterns_fast/
+        # categorize_with_contexts_fast), so this should never actually be
+        # reached. Kept only as a safety-net label - deliberately NOT added
+        # to base_item_cols below, so a plain 'item-noun'/'item-verb'/
+        # 'item-<pos>' schema is all that ever shows up in practice; if this
+        # ever DID get hit, it would still surface as its own column (via
+        # the same dynamic-extra-column mechanism as item-<pos>) rather than
+        # silently disappearing.
+        return 'item-neither'
 
-    item_cols = ['item-noun', 'item-verb', 'item-neither']
+    # Base columns are always present for a stable schema across runs/files;
+    # any other part of speech actually seen among this run's OTHER-predicted
+    # words gets its own additional column, appended in alphabetical order.
+    # 'item-neither' is deliberately NOT a base column - see _item_bucket -
+    # it's redundant now that every real word gets its own item-noun/
+    # item-verb/item-<pos> column, so it only reappears (dynamically) if
+    # something unexpected actually needs it.
+    base_item_cols = ['item-noun', 'item-verb']
     confusion_words = confusion_words_raw[noun_verb_cols].copy()
     if word_cols:
         # Sum raw token-occurrence counts (not distinct word types) per
         # bucket - confusion_words_raw[w] for a given row is how many
         # occurrences of word w had that true tag.
         buckets_by_word = {w: _item_bucket(w) for w in word_cols}
+        extra_item_cols = sorted(set(buckets_by_word.values()) - set(base_item_cols))
+        item_cols = base_item_cols + extra_item_cols
         for bucket in item_cols:
             cols_in_bucket = [w for w in word_cols if buckets_by_word[w] == bucket]
             confusion_words[bucket] = confusion_words_raw[cols_in_bucket].sum(axis=1) if cols_in_bucket else 0
     else:
+        item_cols = base_item_cols
         for bucket in item_cols:
             confusion_words[bucket] = 0
 
@@ -1300,37 +1471,72 @@ def load_corpus_and_split(corpus_file, split_seed=42, test_fraction=0.2,
         train/test split itself), so every independent process reproduces
         the exact same subsample.
 
-    Returns (train, test, train_tags, test_tags, token_counts,
-    sorted_noun_tokens, sorted_verb_tokens).
+    Returns (train, test, train_tags, test_tags, train_words, test_words,
+    token_counts, sorted_noun_tokens, sorted_verb_tokens, word_primary_tag).
+
+    train_words/test_words: the SURFACE WORD FORM aligned index-for-index
+    with train/test (which hold the LEMMA, as before, lowercased and
+    sentence-bounded the same way). Lemma is used only for seed selection
+    (from_tagged_corpus_to_seeds.py, unaffected by this) and for matching
+    seeds to tokens when learning patterns (the is_noun/is_verb checks in
+    extract_context_patterns_fast/compute_pattern_guess_probs/
+    categorize_with_contexts_fast, which all take the lemma arrays) -
+    everything else, including the pattern text itself, the lexical filler
+    recorded for a target/context word, token_counts (test-time target
+    eligibility), and sorted_noun_tokens/sorted_verb_tokens (the
+    all_tagged_nouns_verbs word pool and confusion_words' item-noun/
+    item-verb/item-neither bucketing) is now based on the surface word form.
+
+    word_primary_tag: {surface word form -> its single most frequent corpus
+    tag (e.g. "DET", "ADJ", "AUX", ...), computed over the WHOLE corpus (same
+    scope as noun_tokens/verb_tokens above), ties broken by whichever tag
+    Python's max() sees first for that word. Used by strict_precision_recall
+    to break confusion_words' 'item-neither' bucket down into one column per
+    part of speech (e.g. 'item-adjective', 'item-determiner') for words that
+    aren't primarily nouns or verbs, instead of lumping them all together.
     """
     noun_tokens = defaultdict(int)
     verb_tokens = defaultdict(int)
     token_counts = defaultdict(int)
+    # Per-word tag frequency, over EVERY tag (not just N/V) - used to derive
+    # word_primary_tag below, which drives confusion_words' per-part-of-speech
+    # 'item-<pos>' bucketing for words that aren't primarily nouns or verbs.
+    word_tag_counts = defaultdict(lambda: defaultdict(int))
     tokens = []
+    words = []
     tags = []
     with open(corpus_file) as file:
         for line in file:
             tokens.append("{")
+            words.append("{")
             tags.append("BOS")
             line_array = line.split()
             for element in line_array:
-                # File format is WORD_LEMMA_TAG (e.g. "thought_think_VERB");
-                # use the lemma (middle field), matching how the seed lists
-                # in noun_selection.xlsx/verb_selection.xlsx were built in
-                # from_tagged_corpus_to_seeds.py. Splitting only on the last
-                # underscore would glue WORD_LEMMA together and never match
-                # any seed.
-                la = re.match(r"[^ ]+_([^ ]+)_([^ ]+)", element)
-                w = la.group(1)
-                t = la.group(2)
+                # File format is WORD_LEMMA_TAG (e.g. "thought_think_VERB").
+                # Capture all three fields with the same greedy-prefix
+                # strategy the lemma-only extraction used to use (the first
+                # group still swallows as much as it can before backing off
+                # for the last two required groups) - this means compound/
+                # multi-word tokens (e.g. "thank_you_thank_you_NOUN") get
+                # split the same (already imperfect - see the lemma
+                # extraction this replaces) way for the word field as they
+                # did for the lemma field, rather than introducing a new,
+                # different inconsistency between the two.
+                la = re.match(r"([^ ]+)_([^ ]+)_([^ ]+)", element)
+                surface = la.group(1)
+                w = la.group(2)
+                t = la.group(3)
                 tokens.append(str.lower(w))
+                words.append(str.lower(surface))
                 tags.append(t)
-                token_counts[str.lower(w)] += 1
+                token_counts[str.lower(surface)] += 1
+                word_tag_counts[str.lower(surface)][t] += 1
                 if re.match(r"^N", t):
-                    noun_tokens[str.lower(w)] += 1
+                    noun_tokens[str.lower(surface)] += 1
                 if re.match(r"^V", t):
-                    verb_tokens[str.lower(w)] += 1
+                    verb_tokens[str.lower(surface)] += 1
             tokens.append("}")
+            words.append("}")
             tags.append("EOS")
 
     sorted_noun_counts = sorted(noun_tokens.items(), key=lambda item: item[1], reverse=True)
@@ -1341,6 +1547,19 @@ def load_corpus_and_split(corpus_file, split_seed=42, test_fraction=0.2,
     excluded_verbs = [""]
     sorted_noun_tokens = [x for x in sorted_noun_tokens if x not in excluded_nouns and noun_tokens[x] > verb_tokens[x]]
     sorted_verb_tokens = [x for x in sorted_verb_tokens if x not in excluded_verbs and verb_tokens[x] > noun_tokens[x]]
+
+    # word_primary_tag: each word's single most-frequent tag (e.g. "DET",
+    # "ADJ", "AUX") over the whole corpus - ties broken arbitrarily but
+    # deterministically by dict iteration order (insertion order, i.e. the
+    # tag first seen for that word). Deliberately independent of
+    # sorted_noun_tokens/sorted_verb_tokens above (which only compare N vs V
+    # counts) - this is a full argmax over every tag a word was ever seen
+    # with, used purely for confusion_words' finer-grained item-<pos>
+    # breakdown, not for seed selection or all_tagged_nouns_verbs.
+    word_primary_tag = {
+        w: max(tag_counts.items(), key=lambda kv: kv[1])[0]
+        for w, tag_counts in word_tag_counts.items()
+    }
 
     # Split by utterance (sentence), selecting a random test_fraction of
     # sentences for test. Find all indices where a sentence ends ("}"), then
@@ -1391,14 +1610,16 @@ def load_corpus_and_split(corpus_file, split_seed=42, test_fraction=0.2,
         train_pool = rng.sample(train_pool, corpus_size)
     train_idx_set = set(train_pool)
 
-    train, test, train_tags, test_tags = [], [], [], []
+    train, test, train_tags, test_tags, train_words, test_words = [], [], [], [], [], []
     for i, (s, e) in enumerate(sentence_bounds):
         if i in test_sentence_idx:
             test.extend(tokens[s:e + 1])
             test_tags.extend(tags[s:e + 1])
+            test_words.extend(words[s:e + 1])
         elif i in train_idx_set:
             train.extend(tokens[s:e + 1])
             train_tags.extend(tags[s:e + 1])
+            train_words.extend(words[s:e + 1])
         # else: excluded by subsampling - neither train nor test.
 
     if corpus_size is not None:
@@ -1408,7 +1629,10 @@ def load_corpus_and_split(corpus_file, split_seed=42, test_fraction=0.2,
             f"(of {n_sentences} total)."
         )
 
-    return train, test, train_tags, test_tags, token_counts, sorted_noun_tokens, sorted_verb_tokens
+    return (
+        train, test, train_tags, test_tags, train_words, test_words,
+        token_counts, sorted_noun_tokens, sorted_verb_tokens, word_primary_tag,
+    )
 
 
 def merge_parts(out_dir):
@@ -1531,8 +1755,8 @@ def main():
         merge_parts(args.out_dir)
         return
 
-    (train, test, train_tags, test_tags, token_counts,
-     sorted_noun_tokens, sorted_verb_tokens) = load_corpus_and_split(
+    (train, test, train_tags, test_tags, train_words, test_words, token_counts,
+     sorted_noun_tokens, sorted_verb_tokens, word_primary_tag) = load_corpus_and_split(
         args.corpus_file, split_seed=args.split_seed, test_fraction=args.test_fraction,
         corpus_size=args.corpus_size, subsample_scope=args.subsample_scope,
     )
@@ -1556,6 +1780,7 @@ def main():
             train, test, test_tags,
             noun_seeds, verb_seeds,
             token_counts, sorted_noun_tokens, sorted_verb_tokens,
+            train_words=train_words, test_words=test_words, word_primary_tag=word_primary_tag,
             out_dir=args.out_dir,
             pattern_types=(1, 2, 3),
             train_tags=train_tags,
@@ -1584,7 +1809,7 @@ def main():
         # the matching comment in run_extract_and_evaluate_sweep.
         selected_nouns = list(sorted_noun_tokens)
         selected_verbs = list(sorted_verb_tokens)
-        num_nouns, num_verbs = compute_all_tagged_counts(train, train_tags)
+        num_nouns, num_verbs = compute_all_tagged_counts(train_words, train_tags)
         require_tag_match = False
         all_tagged = True
         step_label = "full"
@@ -1611,6 +1836,7 @@ def main():
         run_extract_and_evaluate, train, test, test_tags,
         selected_nouns, selected_verbs, num_nouns, num_verbs,
         token_counts, sorted_noun_tokens, sorted_verb_tokens,
+        train_words=train_words, test_words=test_words, word_primary_tag=word_primary_tag,
         window_size=args.window_size, pattern_type=args.pattern_type,
         train_tags=train_tags, require_tag_match=require_tag_match,
         all_tagged_nouns_verbs=all_tagged, abstract_context=args.abstract_context,

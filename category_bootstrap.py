@@ -300,6 +300,45 @@ def add_cumulative_proportion(df, prop_col="PROPORTION", cum_col=None):
     return df
 
 
+def df_contexts_to_long(df_contexts):
+    """
+    Convert the (rows=fillers, columns=patterns) sparse count matrix
+    returned by extract_context_patterns_fast into a tidy long-format
+    DataFrame - one row per (pattern, filler, count), count > 0 only - i.e.
+    every pattern LEARNED FROM TRAINING and every filler (a specific corpus
+    word, or "NOUN"/"VERB" if abstracted) it was ever seen with, and how many
+    times. This is the full trained model, not just the subset of patterns
+    actually used to classify a test-set word (that's pattern_usage, in
+    strict_precision_recall).
+
+    Uses the DataFrame's sparse .to_coo() representation directly rather
+    than densifying - df_contexts can have hundreds of thousands of pattern
+    columns for a full-size corpus (see extract_context_patterns_fast), so
+    iterating cell-by-cell or calling .values would be far too slow/memory-
+    heavy. Returns an empty (0-row) DataFrame with the right columns if
+    df_contexts has no columns at all (e.g. an empty seed list produced no
+    patterns).
+
+    Rows are sorted by pattern, then by count descending within each
+    pattern, so the most frequent filler for a pattern appears first -
+    convenient for skimming in a spreadsheet.
+    """
+    columns = ['pattern', 'filler', 'count']
+    if df_contexts.shape[1] == 0:
+        return pd.DataFrame(columns=columns)
+
+    coo = df_contexts.sparse.to_coo()
+    fillers = df_contexts.index.to_numpy()
+    patterns = df_contexts.columns.to_numpy()
+    long_df = pd.DataFrame({
+        'pattern': patterns[coo.col],
+        'filler': fillers[coo.row],
+        'count': coo.data,
+    })
+    long_df = long_df.sort_values(['pattern', 'count'], ascending=[True, False]).reset_index(drop=True)
+    return long_df[columns]
+
+
 def run_extract_and_evaluate(
     train_tokens,
     test_tokens,
@@ -320,10 +359,14 @@ def run_extract_and_evaluate(
     """
     Run extraction on train_tokens, categorize test_tokens (with test_tags),
     and compute strict precision/recall.
-    Returns: (results, metrics, df_contexts)
-    - results: list of (token, pred, true_tag) tuples from categorize_with_contexts_fast
+    Returns: (metrics, df_contexts)
     - metrics: output of strict_precision_recall(results)
-    - df_contexts: DataFrame from extract_context_patterns_fast
+    - df_contexts: the (rows=fillers, columns=patterns) sparse count matrix
+      from extract_context_patterns_fast - the full trained model, i.e.
+      every pattern learned from training and every filler count for it, not
+      just the subset actually used to classify a test-set word (see
+      pattern_usage inside metrics for that). Callers that want this as a
+      spreadsheet-friendly table should pass it to df_contexts_to_long.
 
     train_tokens/test_tokens: the LEMMA sequences - used only for seed
     matching (is_noun/is_verb membership checks). train_words/test_words:
@@ -408,7 +451,7 @@ def run_extract_and_evaluate(
         sorted_noun_tokens=sorted_noun_tokens, sorted_verb_tokens=sorted_verb_tokens,
         word_primary_tag=word_primary_tag,
     )
-    return metrics
+    return metrics, df_contexts
 
 
 def get_max_count_item(this_pattern,df):
@@ -811,8 +854,8 @@ def evaluate_single_run(
     """
     Runs a single (mode, pattern_type, seed-set) configuration and returns
     everything needed to log it - (row, confusion_text, confusion_words,
-    pattern_usage) - WITHOUT writing to any file. This is the atomic unit of
-    work shared by:
+    pattern_usage, learned_patterns) - WITHOUT writing to any file. This is
+    the atomic unit of work shared by:
       - sweep_and_save_runs, which appends the result to a shared
         summary.csv/confusion_matrices.txt (safe since it runs sequentially
         in a single process), and
@@ -821,10 +864,15 @@ def evaluate_single_run(
         instances of this script can run in parallel - e.g. one per core on
         a cluster (see run_cluster.sh) - without corrupting a shared file
         through concurrent writes.
+
+    learned_patterns: the full trained model for this run as a tidy
+    (pattern, filler, count) DataFrame - see df_contexts_to_long - not just
+    the patterns actually used to classify a test-set word (that's
+    pattern_usage).
     """
     print(f"\nRunning [{run_mode}] pattern_type={pattern_type} with num_noun_seeds={num_nouns}, num_verb_seeds={num_verbs}...")
     t0 = time.time()
-    metrics = run_fn(
+    metrics, df_contexts = run_fn(
         train_tokens, test_tokens, test_tags,
         selected_nouns, selected_verbs,
         token_counts, sorted_noun_tokens, sorted_verb_tokens,
@@ -836,6 +884,7 @@ def evaluate_single_run(
         abstract_context=abstract_context,
     )
     t1 = time.time()
+    learned_patterns = df_contexts_to_long(df_contexts)
 
     per_class = metrics['per_class']
     macro = metrics['macro']
@@ -876,7 +925,7 @@ def evaluate_single_run(
         + confusion.to_string() + "\n\n"
     )
 
-    return row, confusion_text, confusion_words, pattern_usage
+    return row, confusion_text, confusion_words, pattern_usage, learned_patterns
 
 
 def sweep_and_save_runs(
@@ -953,7 +1002,7 @@ def sweep_and_save_runs(
                 f"out_dir somewhere new, before re-running."
             )
 
-    def _log(row, confusion_text, confusion_words, pattern_usage, num_nouns, num_verbs):
+    def _log(row, confusion_text, confusion_words, pattern_usage, learned_patterns, num_nouns, num_verbs):
         pd.DataFrame([row]).to_csv(summary_path, mode="a", header=False, index=False)
 
         with open(confusion_path, "a", encoding="utf-8") as f:
@@ -977,8 +1026,17 @@ def sweep_and_save_runs(
             pattern_usage.to_csv(pattern_usage_csv_path)
             print(f"Pattern usage breakdown written to {pattern_usage_csv_path}")
 
+        if learned_patterns is not None:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            learned_patterns_xlsx_path = os.path.join(
+                out_dir,
+                f"learned_patterns_{run_mode_safe}_p{pattern_type}_n{num_nouns}_v{num_verbs}_{ts}.xlsx",
+            )
+            learned_patterns.to_excel(learned_patterns_xlsx_path, index=False)
+            print(f"Learned patterns/fillers written to {learned_patterns_xlsx_path}")
+
     def _run_and_log(selected_nouns, selected_verbs, num_nouns, num_verbs):
-        row, confusion_text, confusion_words, pattern_usage = evaluate_single_run(
+        row, confusion_text, confusion_words, pattern_usage, learned_patterns = evaluate_single_run(
             run_fn, train_tokens, test_tokens, test_tags,
             selected_nouns, selected_verbs, num_nouns, num_verbs,
             token_counts, sorted_noun_tokens, sorted_verb_tokens,
@@ -988,7 +1046,7 @@ def sweep_and_save_runs(
             all_tagged_nouns_verbs=all_tagged_nouns_verbs, abstract_context=abstract_context,
             run_mode=run_mode,
         )
-        _log(row, confusion_text, confusion_words, pattern_usage, num_nouns, num_verbs)
+        _log(row, confusion_text, confusion_words, pattern_usage, learned_patterns, num_nouns, num_verbs)
 
     if all_tagged_nouns_verbs:
         # Single full pass, no sweep over increasing seed-list sizes.
@@ -1832,7 +1890,7 @@ def main():
         selected_verbs = verb_seeds_f.iloc[:num_verbs]['Word'].tolist()
         step_label = f"step{args.seed_step}"
 
-    row, confusion_text, confusion_words, pattern_usage = evaluate_single_run(
+    row, confusion_text, confusion_words, pattern_usage, learned_patterns = evaluate_single_run(
         run_extract_and_evaluate, train, test, test_tags,
         selected_nouns, selected_verbs, num_nouns, num_verbs,
         token_counts, sorted_noun_tokens, sorted_verb_tokens,
@@ -1861,6 +1919,12 @@ def main():
         pattern_usage_csv_path = os.path.join(args.out_dir, f"pattern_usage_{job_id}_{ts}.csv")
         pattern_usage.to_csv(pattern_usage_csv_path)
         print(f"Pattern usage breakdown written to {pattern_usage_csv_path}")
+
+    if learned_patterns is not None:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        learned_patterns_xlsx_path = os.path.join(args.out_dir, f"learned_patterns_{job_id}_{ts}.xlsx")
+        learned_patterns.to_excel(learned_patterns_xlsx_path, index=False)
+        print(f"Learned patterns/fillers written to {learned_patterns_xlsx_path}")
 
     print(f"Single-run result written to {parts_dir}/{job_id}.csv and {conf_parts_dir}/{job_id}.txt")
 

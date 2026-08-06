@@ -407,12 +407,16 @@ def run_extract_and_evaluate(
     # Baseline guess probabilities: the proportion of TRAINING-corpus word
     # occurrences that are in the noun seed list, the verb seed list, or
     # neither (all_tagged_nouns_verbs mode has no seed list, so it uses each
-    # occurrence's own corpus tag instead) - see compute_seed_tag_guess_probs.
-    # Falls back to None (-> baseline_random_scores defaults to the test
-    # set's own frequency) if there were no eligible occurrences at all.
+    # occurrence's own corpus tag instead). require_tag_match mirrors this
+    # run's own criterion - require_tag_match_true also requires the tag to
+    # agree, require_tag_match_false is seed-list membership alone. See
+    # compute_seed_tag_guess_probs. Falls back to None (-> baseline_random_scores
+    # defaults to the test set's own frequency) if there were no eligible
+    # occurrences at all.
     guess_probs = compute_seed_tag_guess_probs(
         train_tokens, seeds, corpus_words=train_words,
         corpus_tags=train_tags, all_tagged_nouns_verbs=all_tagged_nouns_verbs,
+        require_tag_match=require_tag_match,
     )
 
     # token_counts is keyed by surface word form (see load_corpus_and_split),
@@ -624,7 +628,7 @@ def categorize_with_contexts_fast(df, tokens, word_forms, targets,
 
 
 def compute_seed_tag_guess_probs(corpus, seeds, corpus_words=None, corpus_tags=None,
-                                  all_tagged_nouns_verbs=False):
+                                  all_tagged_nouns_verbs=False, require_tag_match=False):
     """
     Guess-probability source for the baseline: the proportion of TRAINING-
     corpus word occurrences that are in the noun seed list, the verb seed
@@ -640,6 +644,11 @@ def compute_seed_tag_guess_probs(corpus, seeds, corpus_words=None, corpus_tags=N
     corpus_tags: the corpus's own per-occurrence POS tags (spaCy-derived -
     see ChildesDataPrep_Eng.ipynb/ChildesDataPrep_JP.ipynb), required.
 
+    require_tag_match mirrors the run's own noun/verb criterion (same flag
+    passed to extract_context_patterns_fast/categorize_with_contexts_fast
+    for this run), so the baseline reflects exactly as much information as
+    that run mode itself uses - ignored when all_tagged_nouns_verbs=True.
+
     For every real-word occurrence in `corpus` (punctuation and the "{"/"}"
     sentence-boundary markers excluded via _is_word_token):
       - all_tagged_nouns_verbs=True: there is no curated seed list in this
@@ -648,15 +657,21 @@ def compute_seed_tag_guess_probs(corpus, seeds, corpus_words=None, corpus_tags=N
         own tag is the only signal available: NOUN if the tag starts "N",
         VERB if it starts "V", matching how this mode already decides
         noun/verb status everywhere else in the pipeline.
-      - Otherwise: NOUN if the word's lemma is in the noun seed list AND
-        this occurrence's own tag starts "N", VERB if it's in the verb seed
-        list AND the tag starts "V". Both conditions are required - a word
-        on the noun seed list whose tag doesn't say "noun" in this
-        particular occurrence is OTHER, not NOUN. Noun takes priority over
-        verb if a lemma somehow appears in both seed lists and both tag
-        checks pass, matching the tie-break convention used for target
-        words elsewhere in this pipeline (see extract_context_patterns_fast).
-      - Anything else (non-all_tagged branch only) is OTHER.
+      - Otherwise, require_tag_match=True (require_tag_match_true mode):
+        NOUN if the word's lemma is in the noun seed list AND this
+        occurrence's own tag starts "N", VERB if it's in the verb seed list
+        AND the tag starts "V". Both conditions are required - a word on
+        the noun seed list whose tag doesn't say "noun" in this particular
+        occurrence is OTHER, not NOUN.
+      - Otherwise, require_tag_match=False (require_tag_match_false mode):
+        NOUN if the word's lemma is in the noun seed list, VERB if it's in
+        the verb seed list - seed-list membership alone decides this,
+        regardless of what this occurrence's own tag says.
+      - In both non-all_tagged cases, noun takes priority over verb on a
+        tie (a lemma in both seed lists, with both conditions satisfied),
+        matching the tie-break convention used for target words elsewhere
+        in this pipeline (see extract_context_patterns_fast). Anything not
+        classified NOUN or VERB is OTHER.
 
     Returns a dict {'NOUN': p_noun, 'VERB': p_verb, 'OTHER': p_other}
     (always sums to 1), or None if there were no eligible occurrences at
@@ -688,9 +703,12 @@ def compute_seed_tag_guess_probs(corpus, seeds, corpus_words=None, corpus_tags=N
         if all_tagged_nouns_verbs:
             is_noun = bool(re.match(r"^N", corpus_tags[i]))
             is_verb = bool(re.match(r"^V", corpus_tags[i]))
-        else:
+        elif require_tag_match:
             is_noun = (word in noun_set) and bool(re.match(r"^N", corpus_tags[i]))
             is_verb = (word in verb_set) and bool(re.match(r"^V", corpus_tags[i]))
+        else:
+            is_noun = word in noun_set
+            is_verb = word in verb_set
 
         if is_noun:
             cat = 'NOUN'
@@ -1272,9 +1290,11 @@ def strict_precision_recall(results, guess_probs=None, sorted_noun_tokens=None,
     guessed NOUN/VERB/OTHER with probabilities guess_probs, scored against
     this run's actual test-set labels (see baseline_random_scores) - no
     confusion matrix is built for it. guess_probs is expected to come from
-    compute_seed_tag_guess_probs (the proportion of training occurrences
-    that are on the noun seed list AND tagged a noun, on the verb seed list
-    AND tagged a verb, or neither), passed in by the caller. If guess_probs
+    compute_seed_tag_guess_probs (the proportion of training occurrences on
+    the noun seed list, the verb seed list, or neither - for
+    require_tag_match_true runs, seed-list membership must also agree with
+    the occurrence's own tag; for require_tag_match_false runs, seed-list
+    membership alone is enough), passed in by the caller. If guess_probs
     isn't provided, falls back to guessing in proportion to the test set's
     own tag frequencies instead.
     Also returns 'pattern_usage': a table of only the patterns actually used

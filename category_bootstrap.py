@@ -404,17 +404,15 @@ def run_extract_and_evaluate(
         abstract_context=abstract_context,
     )
 
-    # Baseline guess probabilities: how often THIS run's own patterns
-    # predict NOUN/VERB/OTHER when self-classifying the training
-    # occurrences that built them, rather than the training set's raw tag
-    # frequency. Falls back to None (-> baseline_random_scores defaults to
-    # the test set's own frequency) if there were no such occurrences at
-    # all (e.g. an empty seed list).
-    guess_probs = compute_pattern_guess_probs(
-        train_tokens, seeds, df_contexts, corpus_words=train_words, window_size=window_size, pattern_type=pattern_type,
-        corpus_tags=train_tags, require_tag_match=require_tag_match,
-        all_tagged_nouns_verbs=all_tagged_nouns_verbs,
-        abstract_context=abstract_context,
+    # Baseline guess probabilities: the proportion of TRAINING-corpus word
+    # occurrences that are in the noun seed list, the verb seed list, or
+    # neither (all_tagged_nouns_verbs mode has no seed list, so it uses each
+    # occurrence's own corpus tag instead) - see compute_seed_tag_guess_probs.
+    # Falls back to None (-> baseline_random_scores defaults to the test
+    # set's own frequency) if there were no eligible occurrences at all.
+    guess_probs = compute_seed_tag_guess_probs(
+        train_tokens, seeds, corpus_words=train_words,
+        corpus_tags=train_tags, all_tagged_nouns_verbs=all_tagged_nouns_verbs,
     )
 
     # token_counts is keyed by surface word form (see load_corpus_and_split),
@@ -471,8 +469,8 @@ def get_max_count_item(this_pattern,df):
         # identities of the tied types (e.g. "NOUN|VERB", or "cat|dog") instead
         # of collapsing them into the uninformative literal string "OTHER".
         # Callers that need a strict NOUN/VERB/OTHER split (scoring in
-        # categorize_with_contexts_fast/compute_pattern_guess_probs) already
-        # treat anything other than the exact strings "NOUN"/"VERB" as OTHER,
+        # categorize_with_contexts_fast) already treat anything other than
+        # the exact strings "NOUN"/"VERB" as OTHER,
         # so this is transparent to them - it only changes what shows up in
         # human-facing output like pattern_usage's "predicted" column.
         return "|".join(sorted(str(label) for label in max_labels))
@@ -625,65 +623,58 @@ def categorize_with_contexts_fast(df, tokens, word_forms, targets,
     return results
 
 
-def compute_pattern_guess_probs(corpus, seeds, df, corpus_words=None, window_size=2, pattern_type=1,
-                                 corpus_tags=None, require_tag_match=False,
-                                 all_tagged_nouns_verbs=False, abstract_context=True):
+def compute_seed_tag_guess_probs(corpus, seeds, corpus_words=None, corpus_tags=None,
+                                  all_tagged_nouns_verbs=False):
     """
-    Self-classification pass over the TRAINING corpus, used as the guess-
-    probability source for the baseline instead of the training set's raw
-    tag frequency.
+    Guess-probability source for the baseline: the proportion of TRAINING-
+    corpus word occurrences that are in the noun seed list, the verb seed
+    list, or neither - NOT a self-classification pass over the run's own
+    learned patterns.
 
     corpus/corpus_words: as in extract_context_patterns_fast - corpus is the
-    LEMMA sequence (used for is_noun/is_verb seed matching), corpus_words is
-    the aligned surface WORD FORM sequence (used for literal pattern text),
-    required and must be the same length as corpus.
+    LEMMA sequence (used for noun/verb seed-list membership, same as
+    everywhere else in the pipeline), corpus_words is the aligned surface
+    WORD FORM sequence (used only to exclude punctuation via
+    _is_word_token). Both required and must be the same length.
 
-    For every training-corpus occurrence where the target word is itself a
-    noun/verb by this run's own criteria (seeds/require_tag_match/
-    all_tagged_nouns_verbs - i.e. every occurrence that fed into the NOUN/
-    VERB rows of df when it was built by extract_context_patterns_fast),
-    this predicts its category using the already-built df (the same
-    primary/fallback pattern lookup categorize_with_contexts_fast uses at
-    test time) and tallies how often the model's own patterns output NOUN/
-    VERB/OTHER. E.g. if seed words occur 100 times in training and the
-    model's patterns classify 10 of those occurrences as NOUN, 10 as VERB,
-    and 80 as OTHER (no confident match), the returned guess probabilities
-    are 0.1/0.1/0.8 - reflecting how decisive/skewed this particular
-    pattern set actually is, rather than the corpus's raw tag proportions.
+    corpus_tags: the corpus's own per-occurrence POS tags (spaCy-derived -
+    see ChildesDataPrep_Eng.ipynb/ChildesDataPrep_JP.ipynb), required.
 
-    Returns a dict {'NOUN': p_noun, 'VERB': p_verb, 'OTHER': p_other}, or
-    None if there were no such occurrences to evaluate (e.g. an empty seed
-    list) - callers should fall back to some other guess distribution in
-    that case.
+    For every real-word occurrence in `corpus` (punctuation and the "{"/"}"
+    sentence-boundary markers excluded via _is_word_token):
+      - all_tagged_nouns_verbs=True: there is no curated seed list in this
+        mode (see compute_all_tagged_counts/sweep_and_save_runs - it treats
+        every corpus-tagged noun/verb as a candidate), so the occurrence's
+        own tag is the only signal available: NOUN if the tag starts "N",
+        VERB if it starts "V", matching how this mode already decides
+        noun/verb status everywhere else in the pipeline.
+      - Otherwise: NOUN if the word's lemma is in the noun seed list AND
+        this occurrence's own tag starts "N", VERB if it's in the verb seed
+        list AND the tag starts "V". Both conditions are required - a word
+        on the noun seed list whose tag doesn't say "noun" in this
+        particular occurrence is OTHER, not NOUN. Noun takes priority over
+        verb if a lemma somehow appears in both seed lists and both tag
+        checks pass, matching the tie-break convention used for target
+        words elsewhere in this pipeline (see extract_context_patterns_fast).
+      - Anything else (non-all_tagged branch only) is OTHER.
+
+    Returns a dict {'NOUN': p_noun, 'VERB': p_verb, 'OTHER': p_other}
+    (always sums to 1), or None if there were no eligible occurrences at
+    all (e.g. an empty corpus) - callers should fall back to some other
+    guess distribution in that case.
     """
-    if (require_tag_match or all_tagged_nouns_verbs) and corpus_tags is None:
-        raise ValueError("corpus_tags must be provided when require_tag_match=True or all_tagged_nouns_verbs=True")
     if corpus_words is None:
         raise ValueError("corpus_words (surface word forms) must be provided")
     if len(corpus_words) != len(corpus):
         raise ValueError("corpus_words must be the same length as corpus")
+    if corpus_tags is None:
+        raise ValueError("corpus_tags must be provided")
+    if len(corpus_tags) != len(corpus):
+        raise ValueError("corpus_tags must be the same length as corpus")
 
     seeds = seeds or {}
     noun_set = set(seeds.get('nouns', []))
     verb_set = set(seeds.get('verbs', []))
-
-    def is_noun(w, idx):
-        if all_tagged_nouns_verbs:
-            return bool(re.match(r"^N", corpus_tags[idx]))
-        if w not in noun_set:
-            return False
-        if require_tag_match:
-            return bool(re.match(r"^N", corpus_tags[idx]))
-        return True
-
-    def is_verb(w, idx):
-        if all_tagged_nouns_verbs:
-            return bool(re.match(r"^V", corpus_tags[idx]))
-        if w not in verb_set:
-            return False
-        if require_tag_match:
-            return bool(re.match(r"^V", corpus_tags[idx]))
-        return True
 
     counts = {'NOUN': 0, 'VERB': 0, 'OTHER': 0}
     total = 0
@@ -691,58 +682,23 @@ def compute_pattern_guess_probs(corpus, seeds, df, corpus_words=None, window_siz
     for i, word in enumerate(corpus):
         if word in ("{", "}"):
             continue
-        # Restrict to occurrences that are themselves a noun/verb by this
-        # run's criteria - exactly the occurrences that fed the NOUN/VERB
-        # rows of df at train time (noun takes priority over verb on
-        # overlap for the TARGET word, matching extract_context_patterns_fast
-        # - note this is the opposite priority from context words below,
-        # where verb takes priority; that asymmetry is intentional and
-        # already present in extract_context_patterns_fast).
-        if not (is_noun(word, i) or is_verb(word, i)):
+        if not _is_word_token(corpus_words[i]):
             continue
 
-        begin = max(i - window_size, 0)
-        end = min(i + window_size, len(corpus) - 1)
-        context_indices = list(range(begin, end + 1))
-        del context_indices[i - begin]
-
-        context = []
-        for idx in context_indices:
-            w = corpus[idx]
-            w_form = corpus_words[idx]
-            if abstract_context and is_verb(w, idx):
-                context.append("verb")
-            elif abstract_context and is_noun(w, idx):
-                context.append("noun")
-            elif w_form in ("{", "}"):
-                context.append(w_form)
-            elif not _is_word_token(w_form):
-                context.append("PUNCT")
-            else:
-                context.append(w_form)
-
-        if len(context) != 4:
-            continue
-
-        p1 = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", context[1] + "_X_" + context[2]))
-        p1a = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", context[1] + "_X"))
-        p2 = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", "X_" + context[2] + "_" + context[3]))
-        p2a = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", "X_" + context[2]))
-        p3 = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", context[0] + "_" + context[1] + "_X"))
-        p3a = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", context[1] + "_X"))
-
-        if pattern_type == 1:
-            primary, fallback = p1, p1a
-        elif pattern_type == 2:
-            primary, fallback = p2, p2a
+        if all_tagged_nouns_verbs:
+            is_noun = bool(re.match(r"^N", corpus_tags[i]))
+            is_verb = bool(re.match(r"^V", corpus_tags[i]))
         else:
-            primary, fallback = p3, p3a
+            is_noun = (word in noun_set) and bool(re.match(r"^N", corpus_tags[i]))
+            is_verb = (word in verb_set) and bool(re.match(r"^V", corpus_tags[i]))
 
-        raw_pred = get_max_count_item(primary, df)
-        if raw_pred is None:
-            raw_pred = get_max_count_item(fallback, df)
+        if is_noun:
+            cat = 'NOUN'
+        elif is_verb:
+            cat = 'VERB'
+        else:
+            cat = 'OTHER'
 
-        cat = raw_pred if raw_pred in ("NOUN", "VERB") else "OTHER"
         counts[cat] += 1
         total += 1
 
@@ -1316,10 +1272,11 @@ def strict_precision_recall(results, guess_probs=None, sorted_noun_tokens=None,
     guessed NOUN/VERB/OTHER with probabilities guess_probs, scored against
     this run's actual test-set labels (see baseline_random_scores) - no
     confusion matrix is built for it. guess_probs is expected to come from
-    compute_pattern_guess_probs (how often THIS run's own patterns predict
-    each category, self-classifying the training data), passed in by the
-    caller. If guess_probs isn't provided, falls back to guessing in
-    proportion to the test set's own tag frequencies instead.
+    compute_seed_tag_guess_probs (the proportion of training occurrences
+    that are on the noun seed list AND tagged a noun, on the verb seed list
+    AND tagged a verb, or neither), passed in by the caller. If guess_probs
+    isn't provided, falls back to guessing in proportion to the test set's
+    own tag frequencies instead.
     Also returns 'pattern_usage': a table of only the patterns actually used
     to classify a test-set word (not the full set of patterns extracted from
     training) - one row per pattern, with the number of times it was used,
@@ -1537,7 +1494,7 @@ def load_corpus_and_split(corpus_file, split_seed=42, test_fraction=0.2,
     sentence-bounded the same way). Lemma is used only for seed selection
     (from_tagged_corpus_to_seeds.py, unaffected by this) and for matching
     seeds to tokens when learning patterns (the is_noun/is_verb checks in
-    extract_context_patterns_fast/compute_pattern_guess_probs/
+    extract_context_patterns_fast/compute_seed_tag_guess_probs/
     categorize_with_contexts_fast, which all take the lemma arrays) -
     everything else, including the pattern text itself, the lexical filler
     recorded for a target/context word, token_counts (test-time target

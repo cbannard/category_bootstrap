@@ -43,7 +43,8 @@ def _is_word_context(tok):
 
 def extract_context_patterns_fast(corpus, seeds, corpus_words=None, window_size=2, dtype=np.int32, pattern_type=1,
                                    corpus_tags=None, require_tag_match=False,
-                                   all_tagged_nouns_verbs=False, abstract_context=True):
+                                   all_tagged_nouns_verbs=False, abstract_context=True,
+                                   track_target_words=False):
     """
     corpus: the LEMMA sequence - used only to match seeds to tokens (is_noun/
         is_verb membership against seeds['nouns']/seeds['verbs'], and the
@@ -81,6 +82,23 @@ def extract_context_patterns_fast(corpus, seeds, corpus_words=None, window_size=
             whenever its own corpus tag says so (tag starting "N"/"V"), i.e. every
             tagged noun and verb in the training corpus is used, not just seeds.
             Takes precedence over require_tag_match. Requires corpus_tags.
+
+    track_target_words:
+        False (default) - only the usual (rows=fillers, columns=patterns) matrix
+            is returned, where a target word that qualifies as a noun/verb is
+            collapsed to the literal row label "NOUN"/"VERB" (original behavior,
+            unaffected by this flag).
+        True - ALSO build and return a second (rows=(filler, category),
+            columns=patterns) sparse matrix, over the same pattern columns,
+            that keeps the target's actual surface word in 'filler' always -
+            never collapsed to "NOUN"/"VERB" - and records its status in a
+            parallel 'category' level ("NOUN"/"VERB"/"OTHER"). This is purely
+            an additional reporting output (see df_target_words_to_long) for
+            inspecting which literal words a pattern was learned from; it does
+            not change the main df_contexts matrix or anything derived from
+            it (categorization/scoring still use the collapsed matrix exactly
+            as before). When True, the function returns (df, df_target_words)
+            instead of just df.
     """
     if (require_tag_match or all_tagged_nouns_verbs) and corpus_tags is None:
         raise ValueError("corpus_tags must be provided when require_tag_match=True or all_tagged_nouns_verbs=True")
@@ -126,6 +144,12 @@ def extract_context_patterns_fast(corpus, seeds, corpus_words=None, window_size=
     cols = []
     data = []
 
+    target_word_types = []
+    target_word_to_idx = {}
+    tw_rows = []
+    tw_cols = []
+    tw_data = []
+
     for i, word in enumerate(corpus):
         word_form = corpus_words[i]
         if word_form not in ("{", "}") and _is_word_token(word_form):
@@ -164,10 +188,21 @@ def extract_context_patterns_fast(corpus, seeds, corpus_words=None, window_size=
                 # literal-filler fallback uses the surface form (word_form).
                 if is_noun(word, i):
                     seed_id = types_to_idx["NOUN"]
+                    target_category = "NOUN"
                 elif is_verb(word, i):
                     seed_id = types_to_idx["VERB"]
+                    target_category = "VERB"
                 else:
                     seed_id = types_to_idx[word_form]
+                    target_category = "OTHER"
+
+                if track_target_words:
+                    tw_key = (word_form, target_category)
+                    tw_id = target_word_to_idx.get(tw_key)
+                    if tw_id is None:
+                        tw_id = len(target_word_types)
+                        target_word_types.append(tw_key)
+                        target_word_to_idx[tw_key] = tw_id
 
                 if pattern_type == 1:
                     p1 = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", context[1] + "_X_" + context[2]))
@@ -186,6 +221,10 @@ def extract_context_patterns_fast(corpus, seeds, corpus_words=None, window_size=
                         rows.append(seed_id)
                         cols.append(idx)
                         data.append(1)
+                        if track_target_words:
+                            tw_rows.append(tw_id)
+                            tw_cols.append(idx)
+                            tw_data.append(1)
                 elif pattern_type == 2:
                     p2 = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", "X_" + context[2] + "_" + context[3]))
                     p2a = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", "X_" + context[2]))
@@ -203,6 +242,10 @@ def extract_context_patterns_fast(corpus, seeds, corpus_words=None, window_size=
                         rows.append(seed_id)
                         cols.append(idx)
                         data.append(1)
+                        if track_target_words:
+                            tw_rows.append(tw_id)
+                            tw_cols.append(idx)
+                            tw_data.append(1)
                 elif pattern_type == 3:
                     p3 = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", context[0] + "_" + context[1] + "_X"))
                     p3a = re.sub(r"(.+\}).+", r"\1", re.sub(r".+(\{.+)", r"\1", context[1] + "_X"))
@@ -221,8 +264,17 @@ def extract_context_patterns_fast(corpus, seeds, corpus_words=None, window_size=
                         rows.append(seed_id)
                         cols.append(idx)
                         data.append(1)
+                        if track_target_words:
+                            tw_rows.append(tw_id)
+                            tw_cols.append(idx)
+                            tw_data.append(1)
     if not data:
-        return pd.DataFrame(np.zeros((len(types), 0), dtype=int), index=types, columns=[])
+        df = pd.DataFrame(np.zeros((len(types), 0), dtype=int), index=types, columns=[])
+        if track_target_words:
+            empty_index = pd.MultiIndex.from_tuples([], names=["filler", "category"])
+            df_target_words = pd.DataFrame(np.zeros((0, 0), dtype=int), index=empty_index, columns=[])
+            return df, df_target_words
+        return df
 
     rows = np.asarray(rows, dtype=np.int32)
     cols = np.asarray(cols, dtype=np.int32)
@@ -235,6 +287,22 @@ def extract_context_patterns_fast(corpus, seeds, corpus_words=None, window_size=
     # len(types) x len(contexts), which can require several GB and crash for
     # no benefit since the matrix is almost entirely zeros.
     df = pd.DataFrame.sparse.from_spmatrix(coo, index=types, columns=contexts)
+
+    if track_target_words:
+        if not tw_data:
+            empty_index = pd.MultiIndex.from_tuples([], names=["filler", "category"])
+            df_target_words = pd.DataFrame(np.zeros((0, len(contexts)), dtype=int), index=empty_index, columns=contexts)
+        else:
+            tw_rows_arr = np.asarray(tw_rows, dtype=np.int32)
+            tw_cols_arr = np.asarray(tw_cols, dtype=np.int32)
+            tw_data_arr = np.asarray(tw_data, dtype=dtype)
+            tw_coo = coo_matrix(
+                (tw_data_arr, (tw_rows_arr, tw_cols_arr)),
+                shape=(len(target_word_types), len(contexts)), dtype=dtype,
+            )
+            tw_index = pd.MultiIndex.from_tuples(target_word_types, names=["filler", "category"])
+            df_target_words = pd.DataFrame.sparse.from_spmatrix(tw_coo, index=tw_index, columns=contexts)
+        return df, df_target_words
 
     return df
 
@@ -339,6 +407,46 @@ def df_contexts_to_long(df_contexts):
     return long_df[columns]
 
 
+def df_target_words_to_long(df_target_words):
+    """
+    Convert the (rows=(filler, category) MultiIndex, columns=patterns)
+    sparse count matrix returned by extract_context_patterns_fast when
+    track_target_words=True into a tidy long-format DataFrame - one row per
+    (pattern, filler, category, count), count > 0 only.
+
+    Unlike df_contexts_to_long's 'filler' column - which collapses a target
+    word to the literal string "NOUN"/"VERB" whenever it qualifies as a
+    noun/verb - this keeps the actual surface word in 'filler' always, and
+    records its NOUN/VERB/OTHER status in a separate 'category' column
+    instead. Covers every word that occurred as a pattern's target during
+    training, not just the non-noun/non-verb "literal filler" words - i.e.
+    every filler in df_contexts_to_long's output, whether it was abstracted
+    to NOUN/VERB there or not, appears here under its actual word with its
+    category.
+
+    Rows are sorted by pattern, then by count descending within each
+    pattern, matching df_contexts_to_long. Returns an empty (0-row)
+    DataFrame with the right columns if df_target_words has no columns at
+    all.
+    """
+    columns = ['pattern', 'filler', 'category', 'count']
+    if df_target_words.shape[1] == 0:
+        return pd.DataFrame(columns=columns)
+
+    coo = df_target_words.sparse.to_coo()
+    fillers = df_target_words.index.get_level_values('filler').to_numpy()
+    categories = df_target_words.index.get_level_values('category').to_numpy()
+    patterns = df_target_words.columns.to_numpy()
+    long_df = pd.DataFrame({
+        'pattern': patterns[coo.col],
+        'filler': fillers[coo.row],
+        'category': categories[coo.row],
+        'count': coo.data,
+    })
+    long_df = long_df.sort_values(['pattern', 'count'], ascending=[True, False]).reset_index(drop=True)
+    return long_df[columns]
+
+
 def run_extract_and_evaluate(
     train_tokens,
     test_tokens,
@@ -355,11 +463,12 @@ def run_extract_and_evaluate(
     window_size=2, pattern_type=1,
     train_tags=None, require_tag_match=False,
     all_tagged_nouns_verbs=False, abstract_context=True,
+    track_target_words=False,
 ):
     """
     Run extraction on train_tokens, categorize test_tokens (with test_tags),
     and compute strict precision/recall.
-    Returns: (metrics, df_contexts)
+    Returns: (metrics, df_contexts, df_target_words)
     - metrics: output of strict_precision_recall(results)
     - df_contexts: the (rows=fillers, columns=patterns) sparse count matrix
       from extract_context_patterns_fast - the full trained model, i.e.
@@ -367,6 +476,15 @@ def run_extract_and_evaluate(
       just the subset actually used to classify a test-set word (see
       pattern_usage inside metrics for that). Callers that want this as a
       spreadsheet-friendly table should pass it to df_contexts_to_long.
+    - df_target_words: None unless track_target_words=True, in which case
+      it's the (rows=(filler, category), columns=patterns) sparse matrix
+      from extract_context_patterns_fast that keeps target words literal
+      instead of collapsed to "NOUN"/"VERB" - see
+      extract_context_patterns_fast and df_target_words_to_long. Does not
+      affect metrics or df_contexts.
+
+    track_target_words: passed straight through to
+        extract_context_patterns_fast - see there.
 
     train_tokens/test_tokens: the LEMMA sequences - used only for seed
     matching (is_noun/is_verb membership checks). train_words/test_words:
@@ -397,12 +515,18 @@ def run_extract_and_evaluate(
 
     seeds = {'nouns': selected_noun_seeds, 'verbs': selected_verb_seeds}
 
-    df_contexts = extract_context_patterns_fast(
+    extraction_result = extract_context_patterns_fast(
         train_tokens, seeds, corpus_words=train_words, window_size=window_size, pattern_type=pattern_type,
         corpus_tags=train_tags, require_tag_match=require_tag_match,
         all_tagged_nouns_verbs=all_tagged_nouns_verbs,
         abstract_context=abstract_context,
+        track_target_words=track_target_words,
     )
+    if track_target_words:
+        df_contexts, df_target_words = extraction_result
+    else:
+        df_contexts = extraction_result
+        df_target_words = None
 
     # Baseline guess probabilities: the proportion of TRAINING-corpus word
     # occurrences that are in the noun seed list, the verb seed list, or
@@ -453,7 +577,7 @@ def run_extract_and_evaluate(
         sorted_noun_tokens=sorted_noun_tokens, sorted_verb_tokens=sorted_verb_tokens,
         word_primary_tag=word_primary_tag,
     )
-    return metrics, df_contexts
+    return metrics, df_contexts, df_target_words
 
 
 def get_max_count_item(this_pattern,df):
@@ -823,13 +947,14 @@ def evaluate_single_run(
     target_prob_cutoff=0.0005, window_size=2, pattern_type=1,
     train_tags=None, require_tag_match=False, all_tagged_nouns_verbs=False,
     abstract_context=True,
+    track_target_words=False,
     run_mode="run",
 ):
     """
     Runs a single (mode, pattern_type, seed-set) configuration and returns
     everything needed to log it - (row, confusion_text, confusion_words,
-    pattern_usage, learned_patterns) - WITHOUT writing to any file. This is
-    the atomic unit of work shared by:
+    pattern_usage, learned_patterns, learned_patterns_words) - WITHOUT
+    writing to any file. This is the atomic unit of work shared by:
       - sweep_and_save_runs, which appends the result to a shared
         summary.csv/confusion_matrices.txt (safe since it runs sequentially
         in a single process), and
@@ -843,10 +968,16 @@ def evaluate_single_run(
     (pattern, filler, count) DataFrame - see df_contexts_to_long - not just
     the patterns actually used to classify a test-set word (that's
     pattern_usage).
+
+    learned_patterns_words: None unless track_target_words=True, in which
+    case it's the same trained model as learned_patterns but with the
+    target's literal surface word always in 'filler' (never collapsed to
+    "NOUN"/"VERB") and its status in a separate 'category' column - see
+    df_target_words_to_long.
     """
     print(f"\nRunning [{run_mode}] pattern_type={pattern_type} with num_noun_seeds={num_nouns}, num_verb_seeds={num_verbs}...")
     t0 = time.time()
-    metrics, df_contexts = run_fn(
+    metrics, df_contexts, df_target_words = run_fn(
         train_tokens, test_tokens, test_tags,
         selected_nouns, selected_verbs,
         token_counts, sorted_noun_tokens, sorted_verb_tokens,
@@ -856,9 +987,11 @@ def evaluate_single_run(
         train_tags=train_tags, require_tag_match=require_tag_match,
         all_tagged_nouns_verbs=all_tagged_nouns_verbs,
         abstract_context=abstract_context,
+        track_target_words=track_target_words,
     )
     t1 = time.time()
     learned_patterns = df_contexts_to_long(df_contexts)
+    learned_patterns_words = df_target_words_to_long(df_target_words) if df_target_words is not None else None
 
     per_class = metrics['per_class']
     macro = metrics['macro']
@@ -899,7 +1032,7 @@ def evaluate_single_run(
         + confusion.to_string() + "\n\n"
     )
 
-    return row, confusion_text, confusion_words, pattern_usage, learned_patterns
+    return row, confusion_text, confusion_words, pattern_usage, learned_patterns, learned_patterns_words
 
 
 def sweep_and_save_runs(
@@ -914,11 +1047,19 @@ def sweep_and_save_runs(
     train_tags=None, require_tag_match=False,
     all_tagged_nouns_verbs=False,
     abstract_context=True,
+    track_target_words=False,
     force_full_seeds=False,
     max_sweep_steps=None,
     run_mode=None,
 ):
     """
+    track_target_words: passed straight through to evaluate_single_run/
+        extract_context_patterns_fast - when True, an additional
+        learned_patterns_words_*.xlsx (literal target word + NOUN/VERB/OTHER
+        category columns, instead of the usual collapsed filler) is written
+        alongside each learned_patterns_*.xlsx. See
+        df_target_words_to_long.
+
     force_full_seeds: run a single pass using the entire (Include==1) seed
         list, rather than sweeping over increasing seed-list sizes. Ignored
         (implied True) when all_tagged_nouns_verbs=True.
@@ -976,7 +1117,7 @@ def sweep_and_save_runs(
                 f"out_dir somewhere new, before re-running."
             )
 
-    def _log(row, confusion_text, confusion_words, pattern_usage, learned_patterns, num_nouns, num_verbs):
+    def _log(row, confusion_text, confusion_words, pattern_usage, learned_patterns, learned_patterns_words, num_nouns, num_verbs):
         pd.DataFrame([row]).to_csv(summary_path, mode="a", header=False, index=False)
 
         with open(confusion_path, "a", encoding="utf-8") as f:
@@ -1009,8 +1150,17 @@ def sweep_and_save_runs(
             learned_patterns.to_excel(learned_patterns_xlsx_path, index=False)
             print(f"Learned patterns/fillers written to {learned_patterns_xlsx_path}")
 
+        if learned_patterns_words is not None:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            learned_patterns_words_xlsx_path = os.path.join(
+                out_dir,
+                f"learned_patterns_words_{run_mode_safe}_p{pattern_type}_n{num_nouns}_v{num_verbs}_{ts}.xlsx",
+            )
+            learned_patterns_words.to_excel(learned_patterns_words_xlsx_path, index=False)
+            print(f"Learned patterns/target-words (literal + category) written to {learned_patterns_words_xlsx_path}")
+
     def _run_and_log(selected_nouns, selected_verbs, num_nouns, num_verbs):
-        row, confusion_text, confusion_words, pattern_usage, learned_patterns = evaluate_single_run(
+        row, confusion_text, confusion_words, pattern_usage, learned_patterns, learned_patterns_words = evaluate_single_run(
             run_fn, train_tokens, test_tokens, test_tags,
             selected_nouns, selected_verbs, num_nouns, num_verbs,
             token_counts, sorted_noun_tokens, sorted_verb_tokens,
@@ -1018,9 +1168,10 @@ def sweep_and_save_runs(
             target_prob_cutoff=target_prob_cutoff, window_size=window_size, pattern_type=pattern_type,
             train_tags=train_tags, require_tag_match=require_tag_match,
             all_tagged_nouns_verbs=all_tagged_nouns_verbs, abstract_context=abstract_context,
+            track_target_words=track_target_words,
             run_mode=run_mode,
         )
-        _log(row, confusion_text, confusion_words, pattern_usage, learned_patterns, num_nouns, num_verbs)
+        _log(row, confusion_text, confusion_words, pattern_usage, learned_patterns, learned_patterns_words, num_nouns, num_verbs)
 
     if all_tagged_nouns_verbs:
         # Single full pass, no sweep over increasing seed-list sizes.
@@ -1073,6 +1224,7 @@ def run_mode_comparison(
     train_tags=None,
     num_sweep_steps=6,
     abstract_context=True,
+    track_target_words=False,
 ):
     """
     For EACH pattern_type in pattern_types (all three by default), runs
@@ -1110,6 +1262,7 @@ def run_mode_comparison(
         out_dir=out_dir, cum_prop_threshold=cum_prop_threshold,
         target_prob_cutoff=target_prob_cutoff, window_size=window_size,
         train_tags=train_tags, abstract_context=abstract_context,
+        track_target_words=track_target_words,
     )
 
     summary_path = confusion_path = None
@@ -1753,6 +1906,16 @@ def build_arg_parser():
              "behavior). Target-word classification (NOUN/VERB row labels) is "
              "unaffected.",
     )
+    parser.add_argument(
+        "--emit-target-words", action="store_true", default=False,
+        help="Also write a learned_patterns_words_*.xlsx alongside each "
+             "learned_patterns_*.xlsx, with the target's literal surface word "
+             "always in a 'filler' column (never collapsed to \"NOUN\"/\"VERB\") "
+             "and its status in a separate 'category' column (\"NOUN\"/\"VERB\"/"
+             "\"OTHER\"). Purely an additional reporting output - does not change "
+             "df_contexts, learned_patterns_*.xlsx, summary.csv, or any "
+             "evaluation metric. Default off (original behavior/file set).",
+    )
     parser.add_argument("--out-dir", default="sweep_out")
     parser.add_argument("--corpus-file", default="manchester_input_tagged_trf_word_and_lemma_postprocessed.txt")
     parser.add_argument("--noun-seeds-file", default="noun_selection.xlsx")
@@ -1823,6 +1986,7 @@ def main():
             cum_prop_threshold=args.cum_prop_threshold,
             window_size=args.window_size,
             abstract_context=args.abstract_context,
+            track_target_words=args.emit_target_words,
         )
         print("summary written to", summary_csv)
         return
@@ -1867,7 +2031,7 @@ def main():
         selected_verbs = verb_seeds_f.iloc[:num_verbs]['Word'].tolist()
         step_label = f"step{args.seed_step}"
 
-    row, confusion_text, confusion_words, pattern_usage, learned_patterns = evaluate_single_run(
+    row, confusion_text, confusion_words, pattern_usage, learned_patterns, learned_patterns_words = evaluate_single_run(
         run_extract_and_evaluate, train, test, test_tags,
         selected_nouns, selected_verbs, num_nouns, num_verbs,
         token_counts, sorted_noun_tokens, sorted_verb_tokens,
@@ -1875,6 +2039,7 @@ def main():
         window_size=args.window_size, pattern_type=args.pattern_type,
         train_tags=train_tags, require_tag_match=require_tag_match,
         all_tagged_nouns_verbs=all_tagged, abstract_context=args.abstract_context,
+        track_target_words=args.emit_target_words,
         run_mode=args.mode,
     )
 
@@ -1902,6 +2067,12 @@ def main():
         learned_patterns_xlsx_path = os.path.join(args.out_dir, f"learned_patterns_{job_id}_{ts}.xlsx")
         learned_patterns.to_excel(learned_patterns_xlsx_path, index=False)
         print(f"Learned patterns/fillers written to {learned_patterns_xlsx_path}")
+
+    if learned_patterns_words is not None:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        learned_patterns_words_xlsx_path = os.path.join(args.out_dir, f"learned_patterns_words_{job_id}_{ts}.xlsx")
+        learned_patterns_words.to_excel(learned_patterns_words_xlsx_path, index=False)
+        print(f"Learned patterns/target-words (literal + category) written to {learned_patterns_words_xlsx_path}")
 
     print(f"Single-run result written to {parts_dir}/{job_id}.csv and {conf_parts_dir}/{job_id}.txt")
 

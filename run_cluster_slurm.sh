@@ -4,7 +4,9 @@
 # mode/pattern-type comparison as a SLURM job array (one array task per
 # job), then submits a merge job that only runs once every array task has
 # finished successfully. See run_cluster.sh's header for the exact set of
-# jobs this generates (39 with the defaults: 3 pattern types x (1 + 6 + 6)).
+# jobs this generates (39 with the defaults: 3 pattern types x (1 + 6 + 6)),
+# and for how --n-folds (default 5, k-fold cross-validation, run internally
+# by each job) affects runtime and per-job output file counts.
 #
 # Every task and the merge job run on:
 #   --partition=serial

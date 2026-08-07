@@ -850,8 +850,13 @@ def compute_seed_tag_guess_probs(corpus, seeds, corpus_words=None, corpus_tags=N
     return {c: counts[c] / total for c in ('NOUN', 'VERB', 'OTHER')}
 
 
-SUMMARY_COLS = [
-    "time", "mode", "pattern_type", "num_noun_seeds", "num_verb_seeds", "runtime_s",
+
+# Metric columns that get averaged (and, for CV mean rows, given a matching
+# "<col>_std" column) across folds - see evaluate_kfold_and_aggregate. Every
+# column here is a plain float computed per fold; runtime_s is included so
+# the mean row also reports average (and std of) per-fold wall time.
+METRIC_COLS = [
+    "runtime_s",
     "NOUN_precision", "NOUN_recall",
     "VERB_precision", "VERB_recall",
     "macro_precision", "macro_recall",
@@ -861,6 +866,21 @@ SUMMARY_COLS = [
     "baseline_macro_precision", "baseline_macro_recall",
     "baseline_micro_precision", "baseline_micro_recall",
 ]
+STD_COLS = [f"{c}_std" for c in METRIC_COLS]
+
+# "fold": None for a run made with n_folds=1 (pre-cross-validation single
+# split) - matches folds' own 'fold'=None convention (see
+# load_corpus_and_split). Otherwise 0..n_folds-1 for an individual fold's
+# own row, or the string "mean" for the row averaging across that job's
+# folds (see evaluate_kfold_and_aggregate) - the STD_COLS are only populated
+# (non-blank) on "mean" rows; individual fold rows and n_folds=1 rows leave
+# them blank (NaN), since a single value has no std to report.
+# "n_folds": how many folds this job's cross-validation used (1 for the
+# pre-cross-validation single-split behavior).
+SUMMARY_COLS = [
+    "time", "mode", "pattern_type", "num_noun_seeds", "num_verb_seeds",
+    "fold", "n_folds",
+] + METRIC_COLS + STD_COLS
 
 
 def compute_all_tagged_counts(train_words, train_tags):
@@ -1035,16 +1055,129 @@ def evaluate_single_run(
     return row, confusion_text, confusion_words, pattern_usage, learned_patterns, learned_patterns_words
 
 
+def evaluate_kfold_and_aggregate(
+    run_fn, folds,
+    selected_nouns, selected_verbs, num_nouns, num_verbs,
+    token_counts, sorted_noun_tokens, sorted_verb_tokens,
+    word_primary_tag=None,
+    target_prob_cutoff=0.0005, window_size=2, pattern_type=1,
+    require_tag_match=False, all_tagged_nouns_verbs=False,
+    abstract_context=True,
+    track_target_words=False,
+    run_mode="run",
+):
+    """
+    Runs evaluate_single_run once per fold in `folds` (see
+    load_corpus_and_split/make_kfold_sentence_splits) and aggregates the
+    results. Returns (rows, confusion_texts, confusion_words_list,
+    pattern_usage_list, learned_patterns_list, learned_patterns_words_list):
+
+    - rows: one row dict per fold (each with 'fold' set to that fold's own
+      label - None if folds is the single n_folds=1 split, else 0..n_folds-1
+      - see load_corpus_and_split), PLUS, only when there's more than one
+      fold, one additional row with 'fold'="mean" giving the across-fold
+      mean of every column in METRIC_COLS and its standard deviation in the
+      matching "<col>_std" column (left as None on the individual per-fold
+      rows - a single value has no std to report). Every row also gets
+      'n_folds' set to len(folds).
+
+    - confusion_texts: list of (fold_label, confusion_text) tuples, one per
+      fold - no aggregate text.
+
+    - confusion_words_list/pattern_usage_list/learned_patterns_list/
+      learned_patterns_words_list: list of (fold_label, num_nouns, num_verbs,
+      value) tuples, one per fold - num_nouns/num_verbs are that SPECIFIC
+      fold's own seed-count display values (see all_tagged_nouns_verbs
+      below - matters because these can differ fold-to-fold), included here
+      so callers building per-fold filenames (see sweep_and_save_runs) don't
+      need to separately re-derive or look them up. No aggregate/merged
+      version of any of these dataframes, since each fold trains on
+      different data, so there's no single "the model" to combine them into
+      (this mirrors why the mean row above only covers scalar metrics, not
+      these per-fold artifacts).
+
+    all_tagged_nouns_verbs: unlike selected_nouns/selected_verbs/num_nouns/
+        num_verbs (which, same as evaluate_single_run, are used as-is for
+        every fold), when this is True, each fold's OWN row instead reports
+        num_noun_seeds/num_verb_seeds recomputed from that fold's own
+        training data via compute_all_tagged_counts (mirroring what the
+        pre-cross-validation single-job path used to compute for this mode),
+        so it varies fold-to-fold with exactly how many distinct noun/verb
+        word types that fold's training split contains. The passed-in
+        num_nouns/num_verbs is then used only as a display fallback (e.g.
+        the mean row's num_noun_seeds/num_verb_seeds, which - being a
+        fixed-across-folds identity/config value everywhere else in this
+        pipeline, not a per-fold metric - is taken from fold 0 rather than
+        averaged).
+    """
+    rows = []
+    confusion_texts = []
+    confusion_words_list = []
+    pattern_usage_list = []
+    learned_patterns_list = []
+    learned_patterns_words_list = []
+
+    n_folds = len(folds)
+    for fold_info in folds:
+        fold_label = fold_info["fold"]
+        if fold_label is not None:
+            print(f"\n=== {run_mode} p{pattern_type} fold {fold_label + 1}/{n_folds} ===")
+
+        fold_num_nouns, fold_num_verbs = num_nouns, num_verbs
+        if all_tagged_nouns_verbs:
+            fold_num_nouns, fold_num_verbs = compute_all_tagged_counts(
+                fold_info["train_words"], fold_info["train_tags"],
+            )
+
+        row, confusion_text, confusion_words, pattern_usage, learned_patterns, learned_patterns_words = evaluate_single_run(
+            run_fn, fold_info["train"], fold_info["test"], fold_info["test_tags"],
+            selected_nouns, selected_verbs, fold_num_nouns, fold_num_verbs,
+            token_counts, sorted_noun_tokens, sorted_verb_tokens,
+            train_words=fold_info["train_words"], test_words=fold_info["test_words"],
+            word_primary_tag=word_primary_tag,
+            target_prob_cutoff=target_prob_cutoff, window_size=window_size, pattern_type=pattern_type,
+            train_tags=fold_info["train_tags"], require_tag_match=require_tag_match,
+            all_tagged_nouns_verbs=all_tagged_nouns_verbs, abstract_context=abstract_context,
+            track_target_words=track_target_words,
+            run_mode=run_mode,
+        )
+        row["fold"] = fold_label
+        row["n_folds"] = n_folds
+        for c in STD_COLS:
+            row[c] = None
+        rows.append(row)
+        confusion_texts.append((fold_label, confusion_text))
+        confusion_words_list.append((fold_label, fold_num_nouns, fold_num_verbs, confusion_words))
+        pattern_usage_list.append((fold_label, fold_num_nouns, fold_num_verbs, pattern_usage))
+        learned_patterns_list.append((fold_label, fold_num_nouns, fold_num_verbs, learned_patterns))
+        learned_patterns_words_list.append((fold_label, fold_num_nouns, fold_num_verbs, learned_patterns_words))
+
+    if n_folds > 1:
+        mean_row = dict(rows[0])
+        mean_row["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        mean_row["fold"] = "mean"
+        mean_row["n_folds"] = n_folds
+        mean_row["num_noun_seeds"] = rows[0]["num_noun_seeds"]
+        mean_row["num_verb_seeds"] = rows[0]["num_verb_seeds"]
+        for c in METRIC_COLS:
+            values = [r[c] for r in rows]
+            mean_row[c] = float(np.mean(values))
+            mean_row[f"{c}_std"] = float(np.std(values))
+        rows.append(mean_row)
+
+    return rows, confusion_texts, confusion_words_list, pattern_usage_list, learned_patterns_list, learned_patterns_words_list
+
+
 def sweep_and_save_runs(
-    run_fn, train_tokens, test_tokens, test_tags,
+    run_fn, folds,
     noun_seeds_df, verb_seeds_df,
     token_counts, sorted_noun_tokens, sorted_verb_tokens,
-    train_words=None, test_words=None, word_primary_tag=None,
+    word_primary_tag=None,
     out_dir="sweep_runs",
     cum_prop_threshold=0.1,
     target_prob_cutoff=0.0005,
     window_size=2, pattern_type=1,
-    train_tags=None, require_tag_match=False,
+    require_tag_match=False,
     all_tagged_nouns_verbs=False,
     abstract_context=True,
     track_target_words=False,
@@ -1053,6 +1186,14 @@ def sweep_and_save_runs(
     run_mode=None,
 ):
     """
+    folds: as returned by load_corpus_and_split - a list of per-split dicts
+        (a single element with 'fold'=None for the pre-cross-validation
+        single 80/20-style split; n_folds elements with 'fold'=0..n_folds-1
+        under k-fold cross-validation). Each (mode, pattern_type, seed-step)
+        configuration this function tries is run once per fold and
+        aggregated by evaluate_kfold_and_aggregate - see there for exactly
+        what gets logged/written per fold vs. only once (as a "mean" row).
+
     track_target_words: passed straight through to evaluate_single_run/
         extract_context_patterns_fast - when True, an additional
         learned_patterns_words_*.xlsx (literal target word + NOUN/VERB/OTHER
@@ -1112,66 +1253,82 @@ def sweep_and_save_runs(
             raise ValueError(
                 f"{summary_path} already exists with columns {existing_header}, "
                 f"which don't match the current schema {SUMMARY_COLS} (this "
-                f"schema now includes 'mode', 'pattern_type' and 'baseline_*' "
-                f"columns). Move, rename, or delete the old file, or point "
-                f"out_dir somewhere new, before re-running."
+                f"schema now includes 'fold', 'n_folds' and '<metric>_std' "
+                f"columns for k-fold cross-validation). Move, rename, or "
+                f"delete the old file, or point out_dir somewhere new, "
+                f"before re-running."
             )
 
-    def _log(row, confusion_text, confusion_words, pattern_usage, learned_patterns, learned_patterns_words, num_nouns, num_verbs):
-        pd.DataFrame([row]).to_csv(summary_path, mode="a", header=False, index=False)
+    def _fold_suffix(fold_label):
+        return "" if fold_label is None else f"_fold{fold_label}"
+
+    def _log(rows, confusion_texts, confusion_words_list, pattern_usage_list,
+              learned_patterns_list, learned_patterns_words_list):
+        pd.DataFrame(rows)[SUMMARY_COLS].to_csv(summary_path, mode="a", header=False, index=False)
 
         with open(confusion_path, "a", encoding="utf-8") as f:
-            f.write(confusion_text)
+            for _fold_label, confusion_text in confusion_texts:
+                f.write(confusion_text)
 
-        if confusion_words is not None:
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            words_csv_path = os.path.join(
-                out_dir,
-                f"confusion_words_{run_mode_safe}_p{pattern_type}_n{num_nouns}_v{num_verbs}_{ts}.csv",
-            )
-            confusion_words.to_csv(words_csv_path)
-            print(f"Word-level confusion breakdown written to {words_csv_path}")
+        for fold_label, num_nouns, num_verbs, confusion_words in confusion_words_list:
+            if confusion_words is not None:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                words_csv_path = os.path.join(
+                    out_dir,
+                    f"confusion_words_{run_mode_safe}_p{pattern_type}_n{num_nouns}_v{num_verbs}"
+                    f"{_fold_suffix(fold_label)}_{ts}.csv",
+                )
+                confusion_words.to_csv(words_csv_path)
+                print(f"Word-level confusion breakdown written to {words_csv_path}")
 
-        if pattern_usage is not None:
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            pattern_usage_csv_path = os.path.join(
-                out_dir,
-                f"pattern_usage_{run_mode_safe}_p{pattern_type}_n{num_nouns}_v{num_verbs}_{ts}.csv",
-            )
-            pattern_usage.to_csv(pattern_usage_csv_path)
-            print(f"Pattern usage breakdown written to {pattern_usage_csv_path}")
+        for fold_label, num_nouns, num_verbs, pattern_usage in pattern_usage_list:
+            if pattern_usage is not None:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                pattern_usage_csv_path = os.path.join(
+                    out_dir,
+                    f"pattern_usage_{run_mode_safe}_p{pattern_type}_n{num_nouns}_v{num_verbs}"
+                    f"{_fold_suffix(fold_label)}_{ts}.csv",
+                )
+                pattern_usage.to_csv(pattern_usage_csv_path)
+                print(f"Pattern usage breakdown written to {pattern_usage_csv_path}")
 
-        if learned_patterns is not None:
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            learned_patterns_xlsx_path = os.path.join(
-                out_dir,
-                f"learned_patterns_{run_mode_safe}_p{pattern_type}_n{num_nouns}_v{num_verbs}_{ts}.xlsx",
-            )
-            learned_patterns.to_excel(learned_patterns_xlsx_path, index=False)
-            print(f"Learned patterns/fillers written to {learned_patterns_xlsx_path}")
+        for fold_label, num_nouns, num_verbs, learned_patterns in learned_patterns_list:
+            if learned_patterns is not None:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                learned_patterns_xlsx_path = os.path.join(
+                    out_dir,
+                    f"learned_patterns_{run_mode_safe}_p{pattern_type}_n{num_nouns}_v{num_verbs}"
+                    f"{_fold_suffix(fold_label)}_{ts}.xlsx",
+                )
+                learned_patterns.to_excel(learned_patterns_xlsx_path, index=False)
+                print(f"Learned patterns/fillers written to {learned_patterns_xlsx_path}")
 
-        if learned_patterns_words is not None:
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            learned_patterns_words_xlsx_path = os.path.join(
-                out_dir,
-                f"learned_patterns_words_{run_mode_safe}_p{pattern_type}_n{num_nouns}_v{num_verbs}_{ts}.xlsx",
-            )
-            learned_patterns_words.to_excel(learned_patterns_words_xlsx_path, index=False)
-            print(f"Learned patterns/target-words (literal + category) written to {learned_patterns_words_xlsx_path}")
+        for fold_label, num_nouns, num_verbs, learned_patterns_words in learned_patterns_words_list:
+            if learned_patterns_words is not None:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                learned_patterns_words_xlsx_path = os.path.join(
+                    out_dir,
+                    f"learned_patterns_words_{run_mode_safe}_p{pattern_type}_n{num_nouns}_v{num_verbs}"
+                    f"{_fold_suffix(fold_label)}_{ts}.xlsx",
+                )
+                learned_patterns_words.to_excel(learned_patterns_words_xlsx_path, index=False)
+                print(f"Learned patterns/target-words (literal + category) written to {learned_patterns_words_xlsx_path}")
 
     def _run_and_log(selected_nouns, selected_verbs, num_nouns, num_verbs):
-        row, confusion_text, confusion_words, pattern_usage, learned_patterns, learned_patterns_words = evaluate_single_run(
-            run_fn, train_tokens, test_tokens, test_tags,
+        (rows, confusion_texts, confusion_words_list, pattern_usage_list,
+         learned_patterns_list, learned_patterns_words_list) = evaluate_kfold_and_aggregate(
+            run_fn, folds,
             selected_nouns, selected_verbs, num_nouns, num_verbs,
             token_counts, sorted_noun_tokens, sorted_verb_tokens,
-            train_words=train_words, test_words=test_words, word_primary_tag=word_primary_tag,
+            word_primary_tag=word_primary_tag,
             target_prob_cutoff=target_prob_cutoff, window_size=window_size, pattern_type=pattern_type,
-            train_tags=train_tags, require_tag_match=require_tag_match,
+            require_tag_match=require_tag_match,
             all_tagged_nouns_verbs=all_tagged_nouns_verbs, abstract_context=abstract_context,
             track_target_words=track_target_words,
             run_mode=run_mode,
         )
-        _log(row, confusion_text, confusion_words, pattern_usage, learned_patterns, learned_patterns_words, num_nouns, num_verbs)
+        _log(rows, confusion_texts, confusion_words_list, pattern_usage_list,
+             learned_patterns_list, learned_patterns_words_list)
 
     if all_tagged_nouns_verbs:
         # Single full pass, no sweep over increasing seed-list sizes.
@@ -1187,10 +1344,12 @@ def sweep_and_save_runs(
         selected_nouns = list(sorted_noun_tokens)
         selected_verbs = list(sorted_verb_tokens)
         # Seed-list sizes (total_noun/total_verb) would be a misleading
-        # thing to log here too - log the actual count of distinct
-        # noun-/verb-tagged word types found in the training corpus instead.
-        num_nouns_display, num_verbs_display = compute_all_tagged_counts(train_words, train_tags)
-        _run_and_log(selected_nouns, selected_verbs, num_nouns_display, num_verbs_display)
+        # thing to log here too - each fold's own row (and filenames) report
+        # the actual count of distinct noun-/verb-tagged word types found in
+        # THAT fold's training data instead, computed inside
+        # evaluate_kfold_and_aggregate. The 0, 0 here is just an unused
+        # placeholder, immediately overridden per fold - see there.
+        _run_and_log(selected_nouns, selected_verbs, 0, 0)
         return summary_path, confusion_path
 
     if force_full_seeds:
@@ -1212,21 +1371,24 @@ def sweep_and_save_runs(
 
 
 def run_mode_comparison(
-    run_fn, train_tokens, test_tokens, test_tags,
+    run_fn, folds,
     noun_seeds_df, verb_seeds_df,
     token_counts, sorted_noun_tokens, sorted_verb_tokens,
-    train_words=None, test_words=None, word_primary_tag=None,
+    word_primary_tag=None,
     out_dir="sweep_runs",
     cum_prop_threshold=0.1,
     target_prob_cutoff=0.0005,
     window_size=2,
     pattern_types=(1, 2, 3),
-    train_tags=None,
     num_sweep_steps=6,
     abstract_context=True,
     track_target_words=False,
 ):
     """
+    folds: as returned by load_corpus_and_split - passed straight through to
+        sweep_and_save_runs (run once per fold, aggregated - see
+        evaluate_kfold_and_aggregate).
+
     For EACH pattern_type in pattern_types (all three by default), runs
     three passes in sequence, sharing the same summary.csv/
     confusion_matrices.txt (distinguished by "mode" and "pattern_type"
@@ -1255,13 +1417,13 @@ def run_mode_comparison(
     Returns the (summary_path, confusion_path) from the very last pass.
     """
     common = dict(
-        run_fn=run_fn, train_tokens=train_tokens, test_tokens=test_tokens, test_tags=test_tags,
+        run_fn=run_fn, folds=folds,
         noun_seeds_df=noun_seeds_df, verb_seeds_df=verb_seeds_df,
         token_counts=token_counts, sorted_noun_tokens=sorted_noun_tokens, sorted_verb_tokens=sorted_verb_tokens,
-        train_words=train_words, test_words=test_words, word_primary_tag=word_primary_tag,
+        word_primary_tag=word_primary_tag,
         out_dir=out_dir, cum_prop_threshold=cum_prop_threshold,
         target_prob_cutoff=target_prob_cutoff, window_size=window_size,
-        train_tags=train_tags, abstract_context=abstract_context,
+        abstract_context=abstract_context,
         track_target_words=track_target_words,
     )
 
@@ -1628,22 +1790,81 @@ def strict_precision_recall(results, guess_probs=None, sorted_noun_tokens=None,
 
 ### RUNTIME CODE STARTS HERE ###
 
+def make_kfold_sentence_splits(n_sentences, n_folds, split_seed):
+    """
+    Partition range(n_sentences) into n_folds folds of nearly-equal size,
+    shuffled deterministically by split_seed, and return a list of
+    (train_idx_set, test_idx_set) pairs - one per fold, fold i's test set
+    being fold i's chunk and its train set being every other chunk.
+
+    Folds are sized as evenly as possible: n_sentences % n_folds of the
+    folds get one extra sentence, so no fold differs from another by more
+    than one sentence. The shuffle + chunking is deterministic given
+    split_seed, so every independent process (see run_cluster.sh)
+    reproduces the exact same folds.
+    """
+    if n_folds < 2:
+        raise ValueError(f"n_folds must be at least 2, got {n_folds}")
+    if n_folds > n_sentences:
+        raise ValueError(
+            f"n_folds ({n_folds}) exceeds the corpus's {n_sentences} sentences"
+        )
+
+    rng = random.Random(split_seed)
+    order = list(range(n_sentences))
+    rng.shuffle(order)
+
+    base, remainder = divmod(n_sentences, n_folds)
+    chunks = []
+    start = 0
+    for fold in range(n_folds):
+        size = base + (1 if fold < remainder else 0)
+        chunks.append(order[start:start + size])
+        start += size
+
+    splits = []
+    for fold in range(n_folds):
+        test_idx_set = set(chunks[fold])
+        train_idx_set = set().union(*(chunks[j] for j in range(n_folds) if j != fold))
+        splits.append((train_idx_set, test_idx_set))
+    return splits
+
+
 def load_corpus_and_split(corpus_file, split_seed=42, test_fraction=0.2,
-                           corpus_size=None, subsample_scope="train_only"):
+                           corpus_size=None, subsample_scope="train_only",
+                           n_folds=5):
     """
     Reads the WORD_LEMMA_TAG corpus file, builds the flat token/tag lists
-    (lemma-lowercased, sentence-bounded by "{"/"}"), then splits it into
-    train/test by randomly holding out test_fraction of sentences (seeded by
-    split_seed, so the same split is reproduced deterministically by every
-    process that calls this with the same arguments - this is what lets
-    run_cluster.sh dispatch each (mode, pattern_type, seed-set) combination
-    to its own independent process/core without sharing any state: each
-    process just redoes this same deterministic corpus load+split itself).
+    (lemma-lowercased, sentence-bounded by "{"/"}"), then splits it by
+    sentence, deterministically given split_seed (so every independent
+    process that calls this with the same arguments reproduces the exact
+    same split(s) - this is what lets run_cluster.sh dispatch each (mode,
+    pattern_type, seed-set) combination to its own independent process/core
+    without sharing any state: each process just redoes this same
+    deterministic corpus load+split itself).
+
+    n_folds: how to split.
+        n_folds >= 2 (default 5) - k-FOLD CROSS-VALIDATION: the corpus (or
+            its corpus_size subsample - see below) is partitioned into
+            n_folds folds (see make_kfold_sentence_splits); every sentence
+            is used as test exactly once, across the n_folds folds
+            train/test pairs returned. test_fraction is ignored (each fold's
+            test set is ~1/n_folds of the pool by construction).
+            subsample_scope is also ignored when corpus_size is given - a
+            fixed held-out test set independent of corpus_size doesn't apply
+            under cross-validation, since every sentence rotates through the
+            test role - so corpus_size always subsamples the whole pool
+            first (like subsample_scope="whole_corpus"), then folds it.
+        n_folds == 1 - the ORIGINAL single train/test split behavior:
+            holds out test_fraction of sentences as a single fixed test set,
+            honoring subsample_scope exactly as before. Use this to
+            reproduce pre-cross-validation runs.
 
     corpus_size: if given, randomly subsample down to this many sentences
         (utterances) instead of using the full corpus. None (default) means
         no subsampling - use every sentence, exactly as before. Which
-        sentences this affects depends on subsample_scope:
+        sentences this affects depends on subsample_scope (n_folds==1 only -
+        see above):
           "train_only" (default) - the held-out test set is always the same
               test_fraction of sentences drawn from the FULL corpus, i.e.
               unaffected by corpus_size, so results across different corpus
@@ -1659,8 +1880,20 @@ def load_corpus_and_split(corpus_file, split_seed=42, test_fraction=0.2,
         train/test split itself), so every independent process reproduces
         the exact same subsample.
 
-    Returns (train, test, train_tags, test_tags, train_words, test_words,
-    token_counts, sorted_noun_tokens, sorted_verb_tokens, word_primary_tag).
+    Returns (folds, token_counts, sorted_noun_tokens, sorted_verb_tokens,
+    word_primary_tag).
+
+    folds: a list of per-split dicts, each with keys 'fold', 'train',
+    'test', 'train_tags', 'test_tags', 'train_words', 'test_words' (the last
+    six exactly as train/test/train_tags/test_tags/train_words/test_words
+    used to be returned directly - see below). When n_folds==1, folds is a
+    single-element list with 'fold'=None (not under cross-validation - keeps
+    single-split callers/output filenames free of any fold labeling). When
+    n_folds>=2, folds has n_folds elements with 'fold'=0..n_folds-1.
+
+    token_counts, sorted_noun_tokens, sorted_verb_tokens, word_primary_tag
+    are computed over the WHOLE corpus (see below) and so are shared/
+    identical across every fold - returned once, not per-fold.
 
     train_words/test_words: the SURFACE WORD FORM aligned index-for-index
     with train/test (which hold the LEMMA, as before, lowercased and
@@ -1749,10 +1982,9 @@ def load_corpus_and_split(corpus_file, split_seed=42, test_fraction=0.2,
         for w, tag_counts in word_tag_counts.items()
     }
 
-    # Split by utterance (sentence), selecting a random test_fraction of
-    # sentences for test. Find all indices where a sentence ends ("}"), then
-    # derive (start, end) bounds for each sentence (a sentence runs from
-    # just after the previous "}" through its own "}", inclusive).
+    # Split by utterance (sentence). Find all indices where a sentence ends
+    # ("}"), then derive (start, end) bounds for each sentence (a sentence
+    # runs from just after the previous "}" through its own "}", inclusive).
     sentence_end_indices = [i for i, tok in enumerate(tokens) if tok == "}"]
     sentence_bounds = []
     start = 0
@@ -1777,48 +2009,95 @@ def load_corpus_and_split(corpus_file, split_seed=42, test_fraction=0.2,
     # order.
     rng = random.Random(split_seed)
 
-    if corpus_size is not None and subsample_scope == "whole_corpus":
-        # Subsample the whole corpus down to corpus_size sentences first, so
-        # both train and test shrink together (test set changes between
-        # corpus sizes).
-        sentence_pool = rng.sample(range(n_sentences), corpus_size)
+    def _extract(train_idx_set, test_idx_set):
+        train, test, train_tags, test_tags, train_words, test_words = [], [], [], [], [], []
+        for i, (s, e) in enumerate(sentence_bounds):
+            if i in test_idx_set:
+                test.extend(tokens[s:e + 1])
+                test_tags.extend(tags[s:e + 1])
+                test_words.extend(words[s:e + 1])
+            elif i in train_idx_set:
+                train.extend(tokens[s:e + 1])
+                train_tags.extend(tags[s:e + 1])
+                train_words.extend(words[s:e + 1])
+            # else: excluded by subsampling - neither train nor test.
+        return train, test, train_tags, test_tags, train_words, test_words
+
+    if n_folds == 1:
+        # Original single train/test split behavior: a single fixed
+        # test_fraction test set, honoring subsample_scope.
+        if corpus_size is not None and subsample_scope == "whole_corpus":
+            # Subsample the whole corpus down to corpus_size sentences
+            # first, so both train and test shrink together (test set
+            # changes between corpus sizes).
+            sentence_pool = rng.sample(range(n_sentences), corpus_size)
+        else:
+            sentence_pool = list(range(n_sentences))
+
+        # Test set: test_fraction of sentence_pool. When subsample_scope
+        # isn't "whole_corpus" (including corpus_size=None), sentence_pool
+        # is always the full range(n_sentences) here, so this draw - and
+        # therefore the resulting test set - is identical regardless of
+        # corpus_size, exactly as the "train_only" scope requires.
+        n_test = int(len(sentence_pool) * test_fraction)
+        test_sentence_idx = set(rng.sample(sentence_pool, n_test))
+        train_pool = [i for i in sentence_pool if i not in test_sentence_idx]
+
+        if corpus_size is not None and subsample_scope == "train_only" and corpus_size < len(train_pool):
+            train_pool = rng.sample(train_pool, corpus_size)
+        train_idx_set = set(train_pool)
+
+        train, test, train_tags, test_tags, train_words, test_words = _extract(train_idx_set, test_sentence_idx)
+
+        if corpus_size is not None:
+            print(
+                f"Corpus subsampled (scope={subsample_scope}, corpus_size={corpus_size}): "
+                f"{len(train_idx_set)} train sentence(s), {len(test_sentence_idx)} test sentence(s) "
+                f"(of {n_sentences} total)."
+            )
+
+        folds = [{
+            "fold": None,
+            "train": train, "test": test,
+            "train_tags": train_tags, "test_tags": test_tags,
+            "train_words": train_words, "test_words": test_words,
+        }]
     else:
-        sentence_pool = list(range(n_sentences))
+        # k-fold cross-validation: every sentence is used as test exactly
+        # once, across n_folds train/test pairs. corpus_size (if given)
+        # always subsamples the whole pool first (subsample_scope is
+        # ignored - see docstring), THEN that pool is folded.
+        if corpus_size is not None:
+            sentence_pool = rng.sample(range(n_sentences), corpus_size)
+        else:
+            sentence_pool = list(range(n_sentences))
 
-    # Test set: test_fraction of sentence_pool. When subsample_scope isn't
-    # "whole_corpus" (including corpus_size=None), sentence_pool is always
-    # the full range(n_sentences) here, so this draw - and therefore the
-    # resulting test set - is identical regardless of corpus_size, exactly
-    # as the "train_only" scope requires.
-    n_test = int(len(sentence_pool) * test_fraction)
-    test_sentence_idx = set(rng.sample(sentence_pool, n_test))
-    train_pool = [i for i in sentence_pool if i not in test_sentence_idx]
+        # make_kfold_sentence_splits partitions range(len(sentence_pool)) -
+        # i.e. positions WITHIN sentence_pool, not raw corpus sentence
+        # indices - map each fold's local indices back through
+        # sentence_pool to get real sentence_bounds indices.
+        fold_splits = make_kfold_sentence_splits(len(sentence_pool), n_folds, split_seed)
+        folds = []
+        for fold_i, (train_local, test_local) in enumerate(fold_splits):
+            train_idx_set = {sentence_pool[j] for j in train_local}
+            test_idx_set = {sentence_pool[j] for j in test_local}
+            train, test, train_tags, test_tags, train_words, test_words = _extract(train_idx_set, test_idx_set)
+            folds.append({
+                "fold": fold_i,
+                "train": train, "test": test,
+                "train_tags": train_tags, "test_tags": test_tags,
+                "train_words": train_words, "test_words": test_words,
+            })
 
-    if corpus_size is not None and subsample_scope == "train_only" and corpus_size < len(train_pool):
-        train_pool = rng.sample(train_pool, corpus_size)
-    train_idx_set = set(train_pool)
-
-    train, test, train_tags, test_tags, train_words, test_words = [], [], [], [], [], []
-    for i, (s, e) in enumerate(sentence_bounds):
-        if i in test_sentence_idx:
-            test.extend(tokens[s:e + 1])
-            test_tags.extend(tags[s:e + 1])
-            test_words.extend(words[s:e + 1])
-        elif i in train_idx_set:
-            train.extend(tokens[s:e + 1])
-            train_tags.extend(tags[s:e + 1])
-            train_words.extend(words[s:e + 1])
-        # else: excluded by subsampling - neither train nor test.
-
-    if corpus_size is not None:
-        print(
-            f"Corpus subsampled (scope={subsample_scope}, corpus_size={corpus_size}): "
-            f"{len(train_idx_set)} train sentence(s), {len(test_sentence_idx)} test sentence(s) "
-            f"(of {n_sentences} total)."
-        )
+        if corpus_size is not None:
+            print(
+                f"Corpus subsampled to corpus_size={corpus_size} sentence(s) "
+                f"(of {n_sentences} total) before {n_folds}-fold split."
+            )
+        print(f"{n_folds}-fold cross-validation: {len(sentence_pool)} sentence(s) split into {n_folds} folds.")
 
     return (
-        train, test, train_tags, test_tags, train_words, test_words,
+        folds,
         token_counts, sorted_noun_tokens, sorted_verb_tokens, word_primary_tag,
     )
 
@@ -1920,23 +2199,43 @@ def build_arg_parser():
     parser.add_argument("--corpus-file", default="manchester_input_tagged_trf_word_and_lemma_postprocessed.txt")
     parser.add_argument("--noun-seeds-file", default="noun_selection.xlsx")
     parser.add_argument("--verb-seeds-file", default="verb_selection.xlsx")
-    parser.add_argument("--test-fraction", type=float, default=0.2)
+    parser.add_argument(
+        "--n-folds", type=int, default=5,
+        help="Number of folds for k-fold cross-validation (default: 5). Every "
+             "sentence is used as test exactly once, across --n-folds train/test "
+             "splits, each run independently - see evaluate_kfold_and_aggregate. "
+             "summary.csv gets one row per fold plus a 'mean' row (mean + std "
+             "across folds); learned_patterns/confusion_words/pattern_usage are "
+             "written once per fold (filenames get a _foldN suffix). Pass "
+             "--n-folds 1 to instead reproduce the original single 80/20-style "
+             "split (see --test-fraction/--split-seed/--subsample-scope, only "
+             "relevant when --n-folds 1).",
+    )
+    parser.add_argument(
+        "--test-fraction", type=float, default=0.2,
+        help="Fraction of sentences held out as the test set. Only used when "
+             "--n-folds 1 (ignored under cross-validation, where each fold's test "
+             "set is ~1/--n-folds by construction).",
+    )
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument(
         "--corpus-size", type=int, default=None,
         help="Randomly subsample the corpus down to this many sentences instead of "
              "using the full corpus. Default (unset) uses the full corpus. See "
-             "--subsample-scope for what exactly gets subsampled.",
+             "--subsample-scope for what exactly gets subsampled (--n-folds 1 only "
+             "- under cross-validation this always subsamples the whole pool "
+             "before folding, regardless of --subsample-scope).",
     )
     parser.add_argument(
         "--subsample-scope", choices=["train_only", "whole_corpus"], default="train_only",
-        help="Only relevant when --corpus-size is given. 'train_only' (default) keeps "
-             "the held-out test set fixed (always the same test_fraction of the FULL "
-             "corpus) and only subsamples the training pool down to --corpus-size, so "
-             "results across different corpus sizes stay comparable against one fixed "
-             "test set. 'whole_corpus' subsamples the full corpus down to --corpus-size "
-             "sentences first, then splits as usual, so the test set also shrinks and "
-             "changes between corpus sizes.",
+        help="Only relevant when --corpus-size is given AND --n-folds 1. "
+             "'train_only' (default) keeps the held-out test set fixed (always "
+             "the same test_fraction of the FULL corpus) and only subsamples the "
+             "training pool down to --corpus-size, so results across different "
+             "corpus sizes stay comparable against one fixed test set. "
+             "'whole_corpus' subsamples the full corpus down to --corpus-size "
+             "sentences first, then splits as usual, so the test set also shrinks "
+             "and changes between corpus sizes.",
     )
     parser.add_argument(
         "--merge", action="store_true",
@@ -1953,10 +2252,11 @@ def main():
         merge_parts(args.out_dir)
         return
 
-    (train, test, train_tags, test_tags, train_words, test_words, token_counts,
+    (folds, token_counts,
      sorted_noun_tokens, sorted_verb_tokens, word_primary_tag) = load_corpus_and_split(
         args.corpus_file, split_seed=args.split_seed, test_fraction=args.test_fraction,
         corpus_size=args.corpus_size, subsample_scope=args.subsample_scope,
+        n_folds=args.n_folds,
     )
 
     noun_seeds = pd.read_excel(args.noun_seeds_file)
@@ -1975,13 +2275,12 @@ def main():
         # confusion_matrices.txt.
         summary_csv = run_mode_comparison(
             run_extract_and_evaluate,
-            train, test, test_tags,
+            folds,
             noun_seeds, verb_seeds,
             token_counts, sorted_noun_tokens, sorted_verb_tokens,
-            train_words=train_words, test_words=test_words, word_primary_tag=word_primary_tag,
+            word_primary_tag=word_primary_tag,
             out_dir=args.out_dir,
             pattern_types=(1, 2, 3),
-            train_tags=train_tags,
             num_sweep_steps=args.num_sweep_steps,
             cum_prop_threshold=args.cum_prop_threshold,
             window_size=args.window_size,
@@ -2008,7 +2307,13 @@ def main():
         # the matching comment in run_extract_and_evaluate_sweep.
         selected_nouns = list(sorted_noun_tokens)
         selected_verbs = list(sorted_verb_tokens)
-        num_nouns, num_verbs = compute_all_tagged_counts(train_words, train_tags)
+        # Each fold's OWN row (and artifact filenames) report the actual
+        # noun/verb counts from THAT fold's own training data, recomputed
+        # inside evaluate_kfold_and_aggregate. This fold-0-based count is
+        # only used below to build a stable job_id - the summary_parts/
+        # confusion_parts file pair covers every fold, not just one, so it
+        # can't embed a single fully-accurate-for-every-fold n/v anyway.
+        num_nouns, num_verbs = compute_all_tagged_counts(folds[0]["train_words"], folds[0]["train_tags"])
         require_tag_match = False
         all_tagged = True
         step_label = "full"
@@ -2031,13 +2336,14 @@ def main():
         selected_verbs = verb_seeds_f.iloc[:num_verbs]['Word'].tolist()
         step_label = f"step{args.seed_step}"
 
-    row, confusion_text, confusion_words, pattern_usage, learned_patterns, learned_patterns_words = evaluate_single_run(
-        run_extract_and_evaluate, train, test, test_tags,
+    (rows, confusion_texts, confusion_words_list, pattern_usage_list,
+     learned_patterns_list, learned_patterns_words_list) = evaluate_kfold_and_aggregate(
+        run_extract_and_evaluate, folds,
         selected_nouns, selected_verbs, num_nouns, num_verbs,
         token_counts, sorted_noun_tokens, sorted_verb_tokens,
-        train_words=train_words, test_words=test_words, word_primary_tag=word_primary_tag,
+        word_primary_tag=word_primary_tag,
         window_size=args.window_size, pattern_type=args.pattern_type,
-        train_tags=train_tags, require_tag_match=require_tag_match,
+        require_tag_match=require_tag_match,
         all_tagged_nouns_verbs=all_tagged, abstract_context=args.abstract_context,
         track_target_words=args.emit_target_words,
         run_mode=args.mode,
@@ -2046,33 +2352,41 @@ def main():
     run_mode_safe = re.sub(r"[^A-Za-z0-9_-]+", "_", args.mode)
     job_id = f"{run_mode_safe}_p{args.pattern_type}_{step_label}_n{num_nouns}_v{num_verbs}"
 
-    pd.DataFrame([row])[SUMMARY_COLS].to_csv(os.path.join(parts_dir, f"{job_id}.csv"), index=False)
+    pd.DataFrame(rows)[SUMMARY_COLS].to_csv(os.path.join(parts_dir, f"{job_id}.csv"), index=False)
     with open(os.path.join(conf_parts_dir, f"{job_id}.txt"), "w", encoding="utf-8") as f:
-        f.write(confusion_text)
+        for _fold_label, confusion_text in confusion_texts:
+            f.write(confusion_text)
 
-    if confusion_words is not None:
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        words_csv_path = os.path.join(args.out_dir, f"confusion_words_{job_id}_{ts}.csv")
-        confusion_words.to_csv(words_csv_path)
-        print(f"Word-level confusion breakdown written to {words_csv_path}")
+    def _fold_suffix(fold_label):
+        return "" if fold_label is None else f"_fold{fold_label}"
 
-    if pattern_usage is not None:
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        pattern_usage_csv_path = os.path.join(args.out_dir, f"pattern_usage_{job_id}_{ts}.csv")
-        pattern_usage.to_csv(pattern_usage_csv_path)
-        print(f"Pattern usage breakdown written to {pattern_usage_csv_path}")
+    for fold_label, _n, _v, confusion_words in confusion_words_list:
+        if confusion_words is not None:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            words_csv_path = os.path.join(args.out_dir, f"confusion_words_{job_id}{_fold_suffix(fold_label)}_{ts}.csv")
+            confusion_words.to_csv(words_csv_path)
+            print(f"Word-level confusion breakdown written to {words_csv_path}")
 
-    if learned_patterns is not None:
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        learned_patterns_xlsx_path = os.path.join(args.out_dir, f"learned_patterns_{job_id}_{ts}.xlsx")
-        learned_patterns.to_excel(learned_patterns_xlsx_path, index=False)
-        print(f"Learned patterns/fillers written to {learned_patterns_xlsx_path}")
+    for fold_label, _n, _v, pattern_usage in pattern_usage_list:
+        if pattern_usage is not None:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            pattern_usage_csv_path = os.path.join(args.out_dir, f"pattern_usage_{job_id}{_fold_suffix(fold_label)}_{ts}.csv")
+            pattern_usage.to_csv(pattern_usage_csv_path)
+            print(f"Pattern usage breakdown written to {pattern_usage_csv_path}")
 
-    if learned_patterns_words is not None:
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        learned_patterns_words_xlsx_path = os.path.join(args.out_dir, f"learned_patterns_words_{job_id}_{ts}.xlsx")
-        learned_patterns_words.to_excel(learned_patterns_words_xlsx_path, index=False)
-        print(f"Learned patterns/target-words (literal + category) written to {learned_patterns_words_xlsx_path}")
+    for fold_label, _n, _v, learned_patterns in learned_patterns_list:
+        if learned_patterns is not None:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            learned_patterns_xlsx_path = os.path.join(args.out_dir, f"learned_patterns_{job_id}{_fold_suffix(fold_label)}_{ts}.xlsx")
+            learned_patterns.to_excel(learned_patterns_xlsx_path, index=False)
+            print(f"Learned patterns/fillers written to {learned_patterns_xlsx_path}")
+
+    for fold_label, _n, _v, learned_patterns_words in learned_patterns_words_list:
+        if learned_patterns_words is not None:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            learned_patterns_words_xlsx_path = os.path.join(args.out_dir, f"learned_patterns_words_{job_id}{_fold_suffix(fold_label)}_{ts}.xlsx")
+            learned_patterns_words.to_excel(learned_patterns_words_xlsx_path, index=False)
+            print(f"Learned patterns/target-words (literal + category) written to {learned_patterns_words_xlsx_path}")
 
     print(f"Single-run result written to {parts_dir}/{job_id}.csv and {conf_parts_dir}/{job_id}.txt")
 

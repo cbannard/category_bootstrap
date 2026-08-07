@@ -14,6 +14,16 @@
 #     - require_tag_match_true,  steps 0..NUM_SWEEP_STEPS-1   (NUM_SWEEP_STEPS jobs - seed-list-based)
 #     - require_tag_match_false, steps 0..NUM_SWEEP_STEPS-1   (NUM_SWEEP_STEPS jobs - seed-list-based)
 #
+# EACH of those 39 jobs now runs category_bootstrap.py's --n-folds (default
+# 5) k-fold cross-validation internally by itself - i.e. each job trains/
+# tests 5 times (once per fold) instead of once, so expect roughly 5x the
+# runtime and roughly 5x the learned_patterns_*/confusion_words_*/
+# pattern_usage_* files (one set per fold, filenames get a _foldN suffix)
+# compared to previous single-split runs. summary.csv gets one row per fold
+# plus a "mean" row (mean + std across folds) for each job. Set
+# EXTRA_ARGS="--n-folds 1" to instead reproduce the original single
+# 80/20-style split (one run per job, no fold suffix, no mean row).
+#
 # Each job writes its own uniquely-named file under
 #   $OUT_DIR/summary_parts/*.csv
 #   $OUT_DIR/confusion_parts/*.txt
@@ -38,16 +48,16 @@
 #                     many sentences instead of using the full corpus
 #                     (forwarded as category_bootstrap.py's --corpus-size to
 #                     every job). Default: unset, i.e. use the full corpus.
-#                     By default this only subsamples the training pool,
-#                     keeping the same held-out test set across every corpus
-#                     size - set EXTRA_ARGS="--subsample-scope whole_corpus"
-#                     to subsample the test set too instead.
+#                     Under cross-validation (--n-folds > 1, the default),
+#                     this always subsamples the whole pool before folding.
 #
 # Any extra category_bootstrap.py options (--corpus-file, --noun-seeds-file,
-# --verb-seeds-file, --cum-prop-threshold, --window-size, --test-fraction,
-# --split-seed, --subsample-scope) can be set via the EXTRA_ARGS environment
-# variable, e.g.:
+# --verb-seeds-file, --cum-prop-threshold, --window-size, --n-folds,
+# --test-fraction, --split-seed, --subsample-scope) can be set via the
+# EXTRA_ARGS environment variable, e.g.:
 #   EXTRA_ARGS="--window-size 3" ./run_cluster.sh sweep_out 6 8
+#   EXTRA_ARGS="--n-folds 10" ./run_cluster.sh sweep_out 6 8
+#   EXTRA_ARGS="--n-folds 1" ./run_cluster.sh sweep_out 6 8   # old single-split behavior
 #
 # On a SLURM (or similar) cluster, replace the `xargs -P "$JOBS"` line below
 # with your job submission command (e.g. `srun`, `sbatch --wait`, or a job

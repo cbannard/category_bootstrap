@@ -26,6 +26,22 @@ parser.add_argument(
         "reviewing which additional lemmas it would newly exclude."
     ),
 )
+parser.add_argument(
+    "--exclude-nouns-file", default=None,
+    help=(
+        "Path to a plain text file listing additional noun lemmas to force "
+        "Include=0 for, one per line (case-insensitive; blank lines and "
+        "lines starting with '#' are ignored). Applied on top of, not "
+        "instead of, the WordNet check and --proper-noun-ratio-threshold - "
+        "use this to manually blocklist proper nouns/names that the "
+        "automatic PROPN-tag-ratio detection misses (e.g. a name that's "
+        "tagged NOUN more often than PROPN in this corpus, so it stays "
+        "under the ratio threshold, but is still not a real common noun). "
+        "Any lemma in the file that doesn't match a lemma currently in the "
+        "noun candidate list is reported but otherwise ignored (useful for "
+        "catching typos in the list itself). Default: none."
+    ),
+)
 args = parser.parse_args()
 
 # Tallies, per lemma, how often it was tagged PROPN vs. NOUN in the RAW
@@ -280,6 +296,40 @@ print(
     f"PROPN >= {args.proper_noun_ratio_threshold:.0%} of the time "
     f"(--proper-noun-ratio-threshold={args.proper_noun_ratio_threshold})."
 )
+
+# Manual blocklist: --exclude-nouns-file lets a human add specific lemmas on
+# top of the automatic PROPN-ratio detection above - e.g. a name that's
+# tagged NOUN more often than PROPN in this corpus (so it survives the ratio
+# threshold) but is still not a real common noun. This never re-includes a
+# word the checks above already excluded; it only ever forces MORE lemmas to
+# Include=0. Recorded in its own "ManuallyExcluded" column (separate from
+# "ProperNounRatio") so it's clear from the seed file alone which mechanism
+# excluded a given lemma.
+nouns["ManuallyExcluded"] = False
+if args.exclude_nouns_file:
+    with open(args.exclude_nouns_file) as f:
+        excluded_lemmas = {
+            line.strip().lower()
+            for line in f
+            if line.strip() and not line.strip().startswith("#")
+        }
+
+    is_manually_excluded = nouns["Word"].str.lower().isin(excluded_lemmas)
+    nouns.loc[is_manually_excluded, "Include"] = 0
+    nouns.loc[is_manually_excluded, "ManuallyExcluded"] = True
+
+    unmatched = sorted(excluded_lemmas - set(nouns["Word"].str.lower()))
+    print(
+        f"--exclude-nouns-file={args.exclude_nouns_file}: forced Include=0 for "
+        f"{int(is_manually_excluded.sum())} of {len(excluded_lemmas)} listed "
+        f"lemma(s)."
+    )
+    if unmatched:
+        print(
+            f"  {len(unmatched)} listed lemma(s) did not match any current "
+            f"noun candidate (check for typos or already-absent lemmas): "
+            f"{unmatched}"
+        )
 
 nouns.to_csv("noun_selection.csv")
 verbs.to_csv("verb_selection.csv")

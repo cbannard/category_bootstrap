@@ -2,6 +2,7 @@ import re
 import random
 import argparse
 import glob
+import sys
 from collections import defaultdict
 import numpy as np
 import pandas as pd
@@ -39,6 +40,75 @@ def _is_word_context(tok):
     not a word.
     """
     return tok not in ("{", "}", "PUNCT")
+
+
+def _split_word_lemma_tag(element):
+    """
+    Split one WORD_LEMMA_TAG corpus token (e.g. "thought_think_VERB") into
+    its (surface_word, lemma, tag) fields.
+
+    tag is always the LAST underscore-separated segment - this corpus's
+    tagset (ADJ, ADP, ADV, AUX, CCONJ, DET, INTJ, NOUN, NUM, PART, PRON,
+    PUNCT, SCONJ, VERB, X) never itself contains an underscore, so this part
+    is unambiguous no matter what word/lemma contain.
+
+    word and lemma are harder: both can themselves contain underscores, for
+    multi-word compounds (proper nouns, fixed phrases) - e.g. the surface
+    form "Thomas train" is recorded as "thomas_train", and when its own
+    lemma is ALSO that same multi-word compound (common for names/fixed
+    phrases the lemmatizer doesn't otherwise normalize), the full raw token
+    becomes "thomas_train_thomas_train_NOUN": four underscore-separated
+    segments before the tag, not the usual two ("thought_think").
+
+    A plain regex can't tell where word ends and lemma begins in a case
+    like that from the string alone. This function resolves it the way an
+    empirical scan of this pipeline's corpus file showed these compounds
+    actually work:
+      - exactly 1 segment before the tag: word = lemma = that segment.
+      - exactly 2 segments: word = first, lemma = second (the ordinary
+        single-word case, e.g. "thought"/"think").
+      - more than 2 segments (a compound): if it splits into two equal-
+        length halves that are IDENTICAL word-for-word (word == lemma as a
+        whole compound - true for 10,774 of the 11,131 >2-segment tokens in
+        this corpus, e.g. "thomas_train_thomas_train"), word = lemma = that
+        half.
+      - otherwise (an uneven/non-matching compound - a small remainder,
+        ~360 tokens/~160 distinct types in this corpus, mostly two-word
+        proper names whose auto-generated lemma doesn't cleanly mirror the
+        surface form, e.g. "fireman_sam_fireman's_fireman"): there's no
+        reliable rule to recover the true split, so word and lemma are BOTH
+        set to the entire original compound string, rather than guessing a
+        boundary that could be silently wrong.
+
+    This deliberately replaces an earlier greedy-regex approach that always
+    guessed some split, which produced garbled results in exactly the
+    common (equal-halves) compound case above - it used to make the WORD
+    "thomas_train_thomas" and the LEMMA just "train", losing the actual
+    compound entirely. This function gets that case exactly right, and
+    refuses to guess (falling back to the whole compound for both fields)
+    rather than risk the same kind of silent corruption on the harder,
+    genuinely ambiguous remainder.
+
+    Returns (surface_word, lemma, tag), all still in their original case -
+    the call site lowercases as needed.
+    """
+    parts = element.split("_")
+    tag = parts[-1]
+    rest = parts[:-1]
+    if len(rest) <= 2:
+        if len(rest) == 1:
+            return rest[0], rest[0], tag
+        return rest[0], rest[1], tag
+    if len(rest) % 2 == 0:
+        half = len(rest) // 2
+        a, b = rest[:half], rest[half:]
+        if a == b:
+            word = "_".join(a)
+            return word, word, tag
+    # Ambiguous compound - refuse to guess a split; keep the whole thing as
+    # both fields (see docstring).
+    whole = "_".join(rest)
+    return whole, whole, tag
 
 
 def extract_context_patterns_fast(corpus, seeds, corpus_words=None, window_size=2, dtype=np.int32, pattern_type=1,
@@ -366,6 +436,73 @@ def add_cumulative_proportion(df, prop_col="PROPORTION", cum_col=None):
     cum_col = cum_col or next((c for c in df.columns if "CUMULATIVE" in str(c).upper()), "CUMULATIVE_PROPORTION")
     df[cum_col] = df[prop_col].cumsum()
     return df
+
+
+def resolve_noun_verb_seed_overlap(noun_seeds, verb_seeds, word_col="Word",
+                                    include_col="Include", prop_col="PROPORTION"):
+    """
+    A lemma can legitimately be tagged as both a noun and a verb somewhere in
+    the corpus (e.g. "walk"), so it can end up with Include==1 in BOTH
+    noun_seeds and verb_seeds independently. Left alone, that word would be
+    used as a seed for both categories at once - is_noun("walk") and
+    is_verb("walk") would both be True in extract_context_patterns_fast/
+    categorize_with_contexts_fast - which isn't a meaningful category
+    assignment for the pattern-learning step.
+
+    Resolve every such conflict by comparing the word's PROPORTION (its
+    share of the FULL noun vocabulary vs. the full verb vocabulary - see
+    add_proportion; must already be present on both dataframes, computed
+    BEFORE any Include filtering) and keeping Include==1 only in whichever
+    category the word accounts for the larger share of - e.g. "walk" at 2%
+    of all noun-tagged tokens vs. 1% of all verb-tagged tokens is kept as a
+    noun seed only, with Include forced to 0 in verb_seeds. Ties (proportions
+    exactly equal) default to keeping the noun assignment - two independently
+    -computed proportions landing on the same float is not expected to occur
+    with real corpus counts.
+
+    Only words that are Include==1 in BOTH dataframes going in count as a
+    conflict - a word that's already excluded from one list isn't actually
+    contending to be a seed there, so there's nothing to resolve.
+
+    Call this once, right after add_proportion has been applied to both
+    dataframes and before any Include-based filtering/seed selection (e.g.
+    compute_seed_steps) - modifies both dataframes' Include column in place
+    (via .loc) and also returns them for convenience.
+    """
+    for label, df in (("noun_seeds", noun_seeds), ("verb_seeds", verb_seeds)):
+        for col in (word_col, include_col, prop_col):
+            if col not in df.columns:
+                raise KeyError(f"{label} is missing required column '{col}'")
+
+    noun_active = noun_seeds[noun_seeds[include_col] == 1]
+    verb_active = verb_seeds[verb_seeds[include_col] == 1]
+
+    overlap = set(noun_active[word_col]) & set(verb_active[word_col])
+    if not overlap:
+        return noun_seeds, verb_seeds
+
+    noun_prop = dict(zip(noun_active[word_col], noun_active[prop_col]))
+    verb_prop = dict(zip(verb_active[word_col], verb_active[prop_col]))
+
+    demote_from_noun = [w for w in overlap if noun_prop[w] < verb_prop[w]]
+    demote_from_verb = [w for w in overlap if noun_prop[w] >= verb_prop[w]]
+
+    if demote_from_verb:
+        verb_seeds.loc[verb_seeds[word_col].isin(demote_from_verb), include_col] = 0
+    if demote_from_noun:
+        noun_seeds.loc[noun_seeds[word_col].isin(demote_from_noun), include_col] = 0
+
+    # stderr, not stdout: --print-num-seed-steps below relies on stdout
+    # containing ONLY the final step count (a dispatcher like run_cluster.sh
+    # captures it via command substitution) - diagnostics must not share it.
+    print(
+        f"Resolved {len(overlap)} noun/verb seed overlap(s): kept as noun seed "
+        f"({len(demote_from_verb)}) or kept as verb seed ({len(demote_from_noun)}), "
+        f"picked by larger share of that category's total token count.",
+        file=sys.stderr,
+    )
+
+    return noun_seeds, verb_seeds
 
 
 def df_contexts_to_long(df_contexts):
@@ -900,20 +1037,69 @@ def compute_all_tagged_counts(train_words, train_tags):
     return len(actual_nouns), len(actual_verbs)
 
 
-def compute_seed_steps(noun_seeds_df, verb_seeds_df, cum_prop_threshold=0.1, max_sweep_steps=None):
+def compute_seed_steps(noun_seeds_df, verb_seeds_df,
+                        max_cum_prop_threshold=0.239, max_sweep_steps=None):
     """
     Filters both seed dataframes down to Include==1 (only words eligible to
     be seeds), recomputes cumulative proportion on that filtered,
-    frequency-ordered subset (see add_cumulative_proportion), then returns
-    the list of (num_nouns, num_verbs) seed-list sizes used by the sweep:
-    starting from the smallest size allowed by cum_prop_threshold, then
-    doubling each step, capped at the full filtered seed-list size and at
-    max_sweep_steps steps (None means no cap - continue until the full list
-    is covered).
+    frequency-ordered subset (see add_cumulative_proportion), then returns a
+    MATCHED SEQUENCE of (num_nouns, num_verbs) pairs - NOT a cross product/
+    grid - one entry per noun count from 1 up to whatever count first
+    reaches max_cum_prop_threshold's share of noun tokens (or the full
+    Include==1 noun list, if smaller).
 
-    Returns (steps, noun_seeds_df, verb_seeds_df) - the seed dataframes
-    returned are the filtered/annotated ones, so callers can slice them
-    directly, e.g. noun_seeds_df.iloc[:num_nouns]['Word'].
+    The matching walks the noun and verb cumulative-proportion staircases
+    together. Each noun count n is paired with every verb count v (0..the
+    full verb list) whose OWN cumulative-proportion "breakpoint" falls
+    strictly after noun count (n-1)'s cumulative proportion and up to and
+    including noun count n's - i.e. whichever verb breakpoints appear while
+    the noun staircase is sitting on step n get attached to step n. v=0 (no
+    verbs at all) counts as a breakpoint at proportion 0, so noun counts
+    whose own proportion is still below the smallest real verb count's
+    proportion get paired with num_verbs=0 rather than being skipped or
+    forced onto verb count 1.
+
+    If a noun step's window happens to contain NO verb breakpoint at all
+    (possible where verbs are coarser than nouns in some stretch), that noun
+    count is still paired with the single best-matching verb count (the
+    largest verb count whose own cumulative proportion doesn't exceed this
+    noun count's), so every noun count in range gets at least one pairing.
+
+    This guarantees every noun count 1..N and every verb count 0..M appears
+    at least once across the returned sequence (N/M being however many of
+    each max_cum_prop_threshold allows) - unlike a "closest single verb
+    count per noun count" scheme, which can skip some verb counts entirely
+    when verb granularity is locally finer than noun granularity. That's
+    exactly why some noun counts end up paired with MORE THAN ONE verb count
+    (two or more verb breakpoints landing in the same noun step's window)
+    rather than every noun mapping to exactly one verb - e.g. with the
+    current seed files/default threshold, noun counts 28-36 each pair with
+    two verb counts while 1-27 each pair with one, for 45 total pairings
+    (36 noun counts, 9 of which contribute 2 pairings each).
+
+    max_sweep_steps (None by default): an optional EXTRA cap on how many
+    noun counts are considered - only noun counts 1..min(N, max_sweep_steps)
+    are used, instead of every noun count max_cum_prop_threshold allows.
+
+    max_cum_prop_threshold exists because the noun and verb seed lists are
+    typically very different sizes (thousands of nouns vs. a few dozen
+    human-curated verbs) - it caps the noun side directly (fewest
+    highest-frequency nouns whose cumulative token share reaches this
+    proportion), and indirectly caps the verb side too, since verbs are only
+    matched up to whatever proportion the noun side reaches. Note a small,
+    curated seed list (e.g. this pipeline's 33 human-approved verbs) can max
+    out well before reaching max_cum_prop_threshold - e.g. all 33 verbs
+    together cover only 23.9% of verb tokens, so raising
+    max_cum_prop_threshold past that point only grows the noun side further,
+    with every extra noun count then pairing with verb count 33 (the full
+    verb list) since there are no higher verb breakpoints left to match.
+
+    Returns (steps, noun_seeds_df, verb_seeds_df):
+      - steps: a list of (num_nouns, num_verbs) tuples, ordered by
+        increasing num_nouns (and, within a noun count that matches more
+        than one verb count, by increasing num_verbs).
+      - noun_seeds_df, verb_seeds_df: the filtered/annotated dataframes, so
+        callers can slice them directly, e.g. noun_seeds_df.iloc[:num_nouns]['Word'].
     """
     for label, df in (("noun_seeds_df", noun_seeds_df), ("verb_seeds_df", verb_seeds_df)):
         if "Include" not in df.columns:
@@ -932,29 +1118,39 @@ def compute_seed_steps(noun_seeds_df, verb_seeds_df, cum_prop_threshold=0.1, max
 
     m_col = _find_cumcol(noun_seeds_df)
     n_col = _find_cumcol(verb_seeds_df)
-    base_m = max(1, int((noun_seeds_df[m_col] < cum_prop_threshold).sum()))
-    base_n = max(1, int((verb_seeds_df[n_col] < cum_prop_threshold).sum()))
+    n_cum = noun_seeds_df[m_col].to_numpy()
+    v_cum = verb_seeds_df[n_col].to_numpy()
+    total_noun = len(n_cum)
+    total_verb = len(v_cum)
 
-    total_noun = len(noun_seeds_df)
-    total_verb = len(verb_seeds_df)
+    n_max = max(1, int((n_cum < max_cum_prop_threshold).sum()) + 1)
+    n_max = min(n_max, total_noun)
+    if max_sweep_steps is not None:
+        n_max = min(n_max, max_sweep_steps)
+
+    def _best_verb_match(p):
+        """Largest verb count whose own cumulative proportion doesn't
+        exceed p, else 0 (no real verb count reaches this low yet)."""
+        best = 0
+        for v in range(1, total_verb + 1):
+            if v_cum[v - 1] <= p:
+                best = v
+            else:
+                break  # v_cum is non-decreasing - nothing later will match either
+        return best
 
     steps = []
-    multiplier = 1
-    seen = set()
-    step = 0
-    while True:
-        if max_sweep_steps is not None and step >= max_sweep_steps:
-            break
-        num_nouns = min(total_noun, base_m * multiplier)
-        num_verbs = min(total_verb, base_n * multiplier)
-        if (num_nouns, num_verbs) in seen:
-            break
-        seen.add((num_nouns, num_verbs))
-        steps.append((num_nouns, num_verbs))
-        step += 1
-        if num_nouns >= total_noun and num_verbs >= total_verb:
-            break
-        multiplier *= 2
+    prev_noun_p = 0.0
+    for n in range(1, n_max + 1):
+        p = n_cum[n - 1]
+        matched = [
+            v for v in range(0, total_verb + 1)
+            if prev_noun_p < (v_cum[v - 1] if v > 0 else 0.0) <= p
+        ]
+        if not matched:
+            matched = [_best_verb_match(p)]
+        steps.extend((n, v) for v in matched)
+        prev_noun_p = p
 
     return steps, noun_seeds_df, verb_seeds_df
 
@@ -1174,7 +1370,7 @@ def sweep_and_save_runs(
     token_counts, sorted_noun_tokens, sorted_verb_tokens,
     word_primary_tag=None,
     out_dir="sweep_runs",
-    cum_prop_threshold=0.1,
+    max_cum_prop_threshold=0.239,
     target_prob_cutoff=0.0005,
     window_size=2, pattern_type=1,
     require_tag_match=False,
@@ -1205,11 +1401,12 @@ def sweep_and_save_runs(
         list, rather than sweeping over increasing seed-list sizes. Ignored
         (implied True) when all_tagged_nouns_verbs=True.
 
-    max_sweep_steps: cap the seed-count sweep to at most this many steps
-        (e.g. 6 for "the first 6 different seed sets"), instead of doubling
-        all the way up to the full seed list. None (default) means no cap -
-        sweep until the full list is covered, as before. Ignored when
-        all_tagged_nouns_verbs=True or force_full_seeds=True (both are
+    max_sweep_steps: optional EXTRA cap on how many noun counts are
+        considered (verb counts are derived from the matched noun counts,
+        not swept independently - see compute_seed_steps) - e.g. 20 means
+        only noun counts 1..20 are used even if max_cum_prop_threshold would
+        otherwise allow more. None (default) means no extra cap. Ignored
+        when all_tagged_nouns_verbs=True or force_full_seeds=True (both are
         already single-pass).
 
     run_mode: a short label identifying what kind of run this is (e.g.
@@ -1235,12 +1432,13 @@ def sweep_and_save_runs(
     confusion_path = os.path.join(out_dir, "confusion_matrices.txt")
 
     # Only words marked Include==1 are eligible to be used as seeds. See
-    # compute_seed_steps for the filtering/cumulative-proportion/doubling
+    # compute_seed_steps for the filtering/cumulative-proportion/matching
     # logic - it's shared with the standalone single-job CLI mode so the
-    # exact same seed-count progression is available to both.
+    # exact same seed-set sequence is available to both.
     steps, noun_seeds_df, verb_seeds_df = compute_seed_steps(
         noun_seeds_df, verb_seeds_df,
-        cum_prop_threshold=cum_prop_threshold, max_sweep_steps=max_sweep_steps,
+        max_cum_prop_threshold=max_cum_prop_threshold,
+        max_sweep_steps=max_sweep_steps,
     )
     total_noun = len(noun_seeds_df)
     total_verb = len(verb_seeds_df)
@@ -1376,11 +1574,11 @@ def run_mode_comparison(
     token_counts, sorted_noun_tokens, sorted_verb_tokens,
     word_primary_tag=None,
     out_dir="sweep_runs",
-    cum_prop_threshold=0.1,
+    max_cum_prop_threshold=0.239,
     target_prob_cutoff=0.0005,
     window_size=2,
     pattern_types=(1, 2, 3),
-    num_sweep_steps=6,
+    num_sweep_steps=None,
     abstract_context=True,
     track_target_words=False,
 ):
@@ -1396,23 +1594,27 @@ def run_mode_comparison(
 
       1. all_tagged_nouns_verbs=True - one full run using every tagged
          noun/verb in the training corpus (mode="all_tagged_nouns_verbs").
-      2. require_tag_match=True, swept across num_sweep_steps seed-list
-         sizes, starting from the smallest allowed (base_m/base_n, from
-         cum_prop_threshold) and doubling num_sweep_steps-1 more times - i.e.
-         num_sweep_steps=6 gives 6 runs (mode="require_tag_match_true").
-      3. require_tag_match=False, swept across the SAME num_sweep_steps
-         seed-list sizes (mode="require_tag_match_false"). "Same" holds
-         because the seed-count progression (base_m/base_n and the doubling
-         sequence) is derived purely from noun_seeds_df/verb_seeds_df +
-         cum_prop_threshold, which are identical across passes 2 and 3 (and
-         across pattern types, since pattern_type doesn't affect seed
-         selection).
+      2. require_tag_match=True, swept across the MATCHED SEQUENCE of
+         (num_nouns, num_verbs) pairs (mode="require_tag_match_true") - see
+         compute_seed_steps for exactly how that sequence is built from
+         max_cum_prop_threshold and num_sweep_steps (every noun count is
+         paired with whichever verb count(s) cover the matching share of
+         verb tokens - NOT a cross product of every noun size with every
+         verb size).
+      3. require_tag_match=False, swept across the SAME sequence of
+         seed-set sizes (mode="require_tag_match_false"). "Same" holds
+         because the sequence is derived purely from noun_seeds_df/
+         verb_seeds_df + max_cum_prop_threshold/num_sweep_steps, which are
+         identical across passes 2 and 3 (and across pattern types, since
+         pattern_type doesn't affect seed selection).
 
-    So with the default pattern_types=(1, 2, 3), this runs 3 * (1 + 2 *
-    num_sweep_steps) passes total. pattern_type is recorded in its own
-    summary.csv column, in the confusion_matrices.txt entry header, and in
-    the confusion-words CSV filename, so every row/entry is traceable to
-    exactly which (pattern_type, mode, seed-set) combination produced it.
+    So with the default pattern_types=(1, 2, 3), this runs 3 * (1 + 2 * G)
+    passes total, where G is the number of (num_nouns, num_verbs) pairings
+    from compute_seed_steps (e.g. G=45 with the current seed files/default
+    threshold). pattern_type is recorded in its own summary.csv column, in
+    the confusion_matrices.txt entry header, and in the confusion-words CSV
+    filename, so every row/entry is traceable to exactly which (pattern_type,
+    mode, seed-set) combination produced it.
 
     Returns the (summary_path, confusion_path) from the very last pass.
     """
@@ -1421,7 +1623,8 @@ def run_mode_comparison(
         noun_seeds_df=noun_seeds_df, verb_seeds_df=verb_seeds_df,
         token_counts=token_counts, sorted_noun_tokens=sorted_noun_tokens, sorted_verb_tokens=sorted_verb_tokens,
         word_primary_tag=word_primary_tag,
-        out_dir=out_dir, cum_prop_threshold=cum_prop_threshold,
+        out_dir=out_dir,
+        max_cum_prop_threshold=max_cum_prop_threshold,
         target_prob_cutoff=target_prob_cutoff, window_size=window_size,
         abstract_context=abstract_context,
         track_target_words=track_target_words,
@@ -1933,20 +2136,11 @@ def load_corpus_and_split(corpus_file, split_seed=42, test_fraction=0.2,
             tags.append("BOS")
             line_array = line.split()
             for element in line_array:
-                # File format is WORD_LEMMA_TAG (e.g. "thought_think_VERB").
-                # Capture all three fields with the same greedy-prefix
-                # strategy the lemma-only extraction used to use (the first
-                # group still swallows as much as it can before backing off
-                # for the last two required groups) - this means compound/
-                # multi-word tokens (e.g. "thank_you_thank_you_NOUN") get
-                # split the same (already imperfect - see the lemma
-                # extraction this replaces) way for the word field as they
-                # did for the lemma field, rather than introducing a new,
-                # different inconsistency between the two.
-                la = re.match(r"([^ ]+)_([^ ]+)_([^ ]+)", element)
-                surface = la.group(1)
-                w = la.group(2)
-                t = la.group(3)
+                # File format is WORD_LEMMA_TAG (e.g. "thought_think_VERB"),
+                # with word/lemma each potentially themselves containing
+                # underscores for multi-word compounds - see
+                # _split_word_lemma_tag for how those are disambiguated.
+                surface, w, t = _split_word_lemma_tag(element)
                 tokens.append(str.lower(w))
                 words.append(str.lower(surface))
                 tags.append(t)
@@ -2173,8 +2367,42 @@ def build_arg_parser():
         help="0-indexed seed-set step to run. Required for --mode require_tag_match_true/"
              "require_tag_match_false; ignored for all_tagged_nouns_verbs.",
     )
-    parser.add_argument("--num-sweep-steps", type=int, default=6)
-    parser.add_argument("--cum-prop-threshold", type=float, default=0.1)
+    parser.add_argument(
+        "--max-cum-prop-threshold", type=float, default=0.239,
+        help="Cap on the noun seed-list size tested, expressed as cumulative "
+             "proportion of noun tokens (e.g. 0.239 = include "
+             "highest-frequency nouns up to the point where they account for "
+             "23.9%% of noun tokens, then stop - or the full Include==1 noun "
+             "list if it's smaller). The seed-set sweep is a MATCHED "
+             "SEQUENCE, NOT a cross product: for each noun count 1..N below "
+             "this cap, it's paired with whichever verb count(s) cover the "
+             "matching share of verb tokens (see compute_seed_steps) - e.g. "
+             "N=36 gives 45 total (num_nouns, num_verbs) pairings with the "
+             "current seed files, not 36*33=1188. Default 0.239 (chosen so "
+             "verbs - only 33 curated words, covering 23.9%% of verb tokens "
+             "at most - are always fully matched, while nouns are capped to "
+             "a comparable ~36-word list with the current seed files).",
+    )
+    parser.add_argument(
+        "--num-sweep-steps", type=int, default=None,
+        help="Optional EXTRA cap on how many noun counts are considered "
+             "(verb counts are derived from the matched noun counts, not "
+             "swept independently) - e.g. 20 means only noun counts 1..20 "
+             "are used even if --max-cum-prop-threshold would otherwise "
+             "allow more. Default: unset - --max-cum-prop-threshold alone "
+             "determines the sequence.",
+    )
+    parser.add_argument(
+        "--print-num-seed-steps", action="store_true",
+        help="Print the number of (num_nouns, num_verbs) pairings that "
+             "--mode require_tag_match_true/require_tag_match_false would "
+             "sweep over with the given --noun-seeds-file/--verb-seeds-file/"
+             "--max-cum-prop-threshold/--num-sweep-steps, then exit "
+             "immediately (skips loading/splitting the corpus - seed-set "
+             "sizes don't depend on it). Useful for a dispatcher (e.g. "
+             "run_cluster.sh) that needs to know how many --seed-step "
+             "values 0..N-1 are valid before generating that many jobs.",
+    )
     parser.add_argument("--window-size", type=int, default=2)
     parser.add_argument(
         "--no-abstract-context", dest="abstract_context", action="store_false",
@@ -2252,6 +2480,24 @@ def main():
         merge_parts(args.out_dir)
         return
 
+    if args.print_num_seed_steps:
+        # Seed-set sequence length doesn't depend on the corpus split at all
+        # - only on the seed files + max-cum-prop-threshold/num-sweep-steps -
+        # so skip load_corpus_and_split entirely here (it can be slow) and just
+        # replicate the seed-loading steps below.
+        noun_seeds = pd.read_excel(args.noun_seeds_file)
+        verb_seeds = pd.read_excel(args.verb_seeds_file)
+        noun_seeds = add_proportion(noun_seeds)
+        verb_seeds = add_proportion(verb_seeds)
+        noun_seeds, verb_seeds = resolve_noun_verb_seed_overlap(noun_seeds, verb_seeds)
+        steps, _, _ = compute_seed_steps(
+            noun_seeds, verb_seeds,
+            max_cum_prop_threshold=args.max_cum_prop_threshold,
+            max_sweep_steps=args.num_sweep_steps,
+        )
+        print(len(steps))
+        return
+
     (folds, token_counts,
      sorted_noun_tokens, sorted_verb_tokens, word_primary_tag) = load_corpus_and_split(
         args.corpus_file, split_seed=args.split_seed, test_fraction=args.test_fraction,
@@ -2267,6 +2513,13 @@ def main():
     # Include==1 words.
     noun_seeds = add_proportion(noun_seeds)
     verb_seeds = add_proportion(verb_seeds)
+    # A word can be Include==1 in both seed lists at once (e.g. "walk" as
+    # both noun and verb) - resolve that by keeping it a seed only in
+    # whichever category it accounts for the larger share of (see
+    # resolve_noun_verb_seed_overlap). Must run after add_proportion (needs
+    # PROPORTION) and before any Include-based filtering/seed selection
+    # below (compute_seed_steps, all_tagged_nouns_verbs path, etc.).
+    noun_seeds, verb_seeds = resolve_noun_verb_seed_overlap(noun_seeds, verb_seeds)
 
     if args.mode is None:
         # Original single-machine behavior: run the full in-process
@@ -2282,7 +2535,7 @@ def main():
             out_dir=args.out_dir,
             pattern_types=(1, 2, 3),
             num_sweep_steps=args.num_sweep_steps,
-            cum_prop_threshold=args.cum_prop_threshold,
+            max_cum_prop_threshold=args.max_cum_prop_threshold,
             window_size=args.window_size,
             abstract_context=args.abstract_context,
             track_target_words=args.emit_target_words,
@@ -2323,7 +2576,8 @@ def main():
         if args.seed_step is None:
             raise SystemExit(f"--seed-step is required for --mode {args.mode}")
         steps, noun_seeds_f, verb_seeds_f = compute_seed_steps(
-            noun_seeds, verb_seeds, cum_prop_threshold=args.cum_prop_threshold,
+            noun_seeds, verb_seeds,
+            max_cum_prop_threshold=args.max_cum_prop_threshold,
             max_sweep_steps=args.num_sweep_steps,
         )
         if not (0 <= args.seed_step < len(steps)):

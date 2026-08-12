@@ -1,9 +1,39 @@
+import argparse
 import nltk
 import wn
 import pandas as pd
 import re
 import time
 from collections import defaultdict
+
+parser = argparse.ArgumentParser(
+    description="Build noun/verb seed candidate lists from a tagged corpus."
+)
+parser.add_argument(
+    "--proper-noun-ratio-threshold", type=float, default=0.99,
+    help=(
+        "Force Include=0 for noun lemmas tagged PROPN at least this fraction "
+        "of the time in the raw corpus (measured before the PROPN->NOUN "
+        "retag below collapses the distinction) - i.e. proper nouns/names "
+        "get excluded from the seed list, but are still retagged to NOUN so "
+        "they remain valid corpus-tagged nouns/targets everywhere else in "
+        "the pipeline (see category_bootstrap.py). Default 0.99 is "
+        "deliberately conservative: this corpus has many physical-entity "
+        "nouns that happen to share a name with a TV/story character (e.g. "
+        "'teddy' is tagged PROPN ~79%% of the time, 'bear' ~53%%) - a lower "
+        "threshold would wrongly exclude those from the seed list. Only "
+        "lower this (e.g. --proper-noun-ratio-threshold 0.5) after "
+        "reviewing which additional lemmas it would newly exclude."
+    ),
+)
+args = parser.parse_args()
+
+# Tallies, per lemma, how often it was tagged PROPN vs. NOUN in the RAW
+# tagger output - filled in below, before the "_PROPN"->"_NOUN" substitution
+# collapses that distinction. Used after the WordNet inclusion check further
+# down to force Include=0 for lemmas that are proper nouns/names.
+proper_noun_tag_counts = defaultdict(lambda: {"PROPN": 0, "NOUN": 0})
+_propn_noun_pat = re.compile(r"([^ _]+)_([^ _]+)_(PROPN|NOUN)")
 
 lemma_file="manchester_input_tagged_trf_word_and_lemma.txt"
 output_filename="manchester_input_tagged_trf_word_and_lemma_postprocessed.txt"
@@ -16,6 +46,9 @@ with open(output_filename, 'w') as fi:
             line = line.rstrip()
             line = re.sub("gon_go_VERB na_to_([A-Z]+)","gonna_gonna_VERB",line)
             line = re.sub("got_got_VERB ta_to_([A-Z]+)","gotta_gotta_VERB",line)
+            for m in _propn_noun_pat.finditer(line):
+                _lemma, _tag = m.group(2).lower(), m.group(3)
+                proper_noun_tag_counts[_lemma][_tag] += 1
             line = re.sub("_PROPN","_NOUN",line)
             line = re.sub("wanna_[A-Z]+","wanna_VERB",line)
             line = re.sub("hasta_[A-Z]+","hasta_VERB",line)
@@ -59,6 +92,49 @@ with open(output_filename, 'w') as fi:
             line = re.sub("(pretend)_NOUN","\\1_X",line)
             line = re.sub("(-)_NOUN","\\1_X",line)
             line = re.sub("(upsidedown)_NOUN","\\1_X",line)
+
+            # The trf tagger's lemmatizer treats a trailing "s" as a regular
+            # plural marker and strips it even for English "plurale tantum"
+            # nouns that have no singular form - it never occurs bare in the
+            # corpus, isn't a real word on its own, and WordNet only
+            # recognizes the "+s" form (e.g. "clothes"_"clothe"_NOUN, where
+            # "clothe" the noun doesn't exist, but "clothes" does and is
+            # correctly classified as a physical entity/apparel). Detected by
+            # scanning for lemmas where (a) the bare lemma's own surface form
+            # never occurs, (b) essentially all occurrences are the "+s"
+            # surface form, (c) the bare lemma has no WordNet noun sense, and
+            # (d) "+s" does. Retag the lemma (not the surface form, which is
+            # already correct) back to the "+s" form so it merges with any
+            # correctly-lemmatized occurrences and gets a correct WordNet
+            # inclusion decision below.
+            #
+            # NOT included here: "leed"/"thoma"/"hercule"/"missi" (->
+            # "leeds"/"thomas"/"hercules"/"missis") - these hit the same
+            # detection rule, but they're proper nouns/character names
+            # (Leeds the city, Thomas the Tank Engine, Hercules, "the
+            # missis"), and WordNet also has entries for those as named
+            # individuals. "Fixing" the lemma there would flip them to
+            # Include=1 for the wrong reason - pulling a specific named
+            # individual into what's meant to be a common-noun seed list.
+            # There's no signal in this (fully lowercased) corpus to tell
+            # those apart automatically, so they're left as-is (excluded)
+            # rather than auto-corrected.
+            line = re.sub("_clothe_NOUN","_clothes_NOUN",line)
+            line = re.sub("_knicker_NOUN","_knickers_NOUN",line)
+            line = re.sub("_thank_NOUN","_thanks_NOUN",line)
+            line = re.sub("_scissor_NOUN","_scissors_NOUN",line)
+            line = re.sub("_tight_NOUN","_tights_NOUN",line)
+            line = re.sub("_underpant_NOUN","_underpants_NOUN",line)
+            line = re.sub("_after_NOUN","_afters_NOUN",line)
+            line = re.sub("_gymnastic_NOUN","_gymnastics_NOUN",line)
+            line = re.sub("_dramatic_NOUN","_dramatics_NOUN",line)
+            line = re.sub("_lazybone_NOUN","_lazybones_NOUN",line)
+            line = re.sub("_aerobic_NOUN","_aerobics_NOUN",line)
+            line = re.sub("_oasi_NOUN","_oasis_NOUN",line)
+            line = re.sub("_acrobatic_NOUN","_acrobatics_NOUN",line)
+            line = re.sub("_logistic_NOUN","_logistics_NOUN",line)
+            line = re.sub("_tiddlywink_NOUN","_tiddlywinks_NOUN",line)
+
             fi.write(line + "\n")
 
 
@@ -69,6 +145,7 @@ tokens=[]
 tags=[]
 filename="manchester_input_tagged_trf_word_and_lemma_postprocessed.txt"
 names=["anna","anne","aran","becky","carl","caroline","dominic","gail","joel","john","julie","liz","nicole","nina","rachel","ruth","warren","wayne"]
+# add mummy, daddy etc?
 
 with open(filename) as file:
         for line in file:
@@ -148,7 +225,17 @@ progress_every = max(1, num_nouns_to_check // 50) if num_nouns_to_check else 1
 d= defaultdict(int)
 for i in range(num_nouns_to_check):
     lemma=str(nouns.iloc[i,0])
-    syns =  en.synsets(lemma, pos='n')
+    # The corpus (and therefore this lemma) joins multiword compounds with
+    # "+" (e.g. "ice+cream"), but WordNet's own multiword entries are joined
+    # with "_" (e.g. "ice_cream") - "+" never matches anything in WordNet, so
+    # every multiword lemma was silently falling through to Include=0
+    # regardless of whether WordNet actually knows the compound. Query
+    # WordNet using the "_"-joined form, but keep `lemma` (with "+") as the
+    # dict key / eventual "Word" value, since that's what has to keep
+    # matching the corpus's own "+"-joined lemmas downstream (see
+    # category_bootstrap.py's noun_set/verb_set seed matching).
+    wordnet_lookup_lemma = lemma.replace("+", "_")
+    syns =  en.synsets(wordnet_lookup_lemma, pos='n')
     lem=[]
     for this_syn in syns:
       for path in wn.taxonomy.hypernym_paths(this_syn):
@@ -167,6 +254,32 @@ for i in range(num_nouns_to_check):
 print(f"WordNet noun inclusion check done in {time.time() - noun_check_start:.0f}s.")
 
 nouns=nouns.merge(pd.DataFrame(d.items(),columns=["Word","Include"]),left_on='Word',right_on='Word')
+
+# Force Include=0 for lemmas that are proper nouns/names, per
+# proper_noun_tag_counts collected above - this overrides whatever WordNet
+# said, since WordNet also has entries for many named individuals (e.g.
+# "thomas", "leeds", "hercules", "missis" all resolve to a WordNet noun
+# sense and would otherwise get Include=1 for the wrong reason - a named
+# individual, not a common-noun category). See --proper-noun-ratio-threshold
+# above for why this is a ratio rather than "ever tagged PROPN" - many
+# ordinary physical-entity nouns in this corpus (teddy, bear, fox, dolly...)
+# are ALSO sometimes tagged PROPN (character-name confusion) without being
+# proper nouns themselves.
+def _propn_ratio(lemma):
+    counts = proper_noun_tag_counts.get(lemma)
+    if not counts:
+        return 0.0
+    total = counts["PROPN"] + counts["NOUN"]
+    return (counts["PROPN"] / total) if total else 0.0
+
+nouns["ProperNounRatio"] = nouns["Word"].map(_propn_ratio)
+is_proper_name = nouns["ProperNounRatio"] >= args.proper_noun_ratio_threshold
+nouns.loc[is_proper_name, "Include"] = 0
+print(
+    f"Forced Include=0 for {int(is_proper_name.sum())} noun lemma(s) tagged "
+    f"PROPN >= {args.proper_noun_ratio_threshold:.0%} of the time "
+    f"(--proper-noun-ratio-threshold={args.proper_noun_ratio_threshold})."
+)
 
 nouns.to_csv("noun_selection.csv")
 verbs.to_csv("verb_selection.csv")

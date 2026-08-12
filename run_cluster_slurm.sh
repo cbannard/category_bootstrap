@@ -4,14 +4,21 @@
 # mode/pattern-type comparison as a SLURM job array (one array task per
 # job), then submits a merge job that only runs once every array task has
 # finished successfully. See run_cluster.sh's header for the exact set of
-# jobs this generates (39 with the defaults: 3 pattern types x (1 + 6 + 6)),
-# and for how --n-folds (default 5, k-fold cross-validation, run internally
-# by each job) affects runtime and per-job output file counts.
+# jobs this generates (3 pattern types x (1 + NUM_STEPS + NUM_STEPS), where
+# NUM_STEPS is the MATCHED SEQUENCE of (num_nouns, num_verbs) seed-set
+# pairings - NOT a cross product/grid - queried fresh each run via
+# --print-num-seed-steps - see run_cluster.sh's header for details), and for
+# how --n-folds (default 5, k-fold cross-validation, run internally by each
+# job) affects runtime and per-job output file counts.
 #
 # Every task and the merge job run on:
 #   --partition=serial
 #   --time=1-00:00:00     (1 day)
-# Override either via the PARTITION / TIME_LIMIT environment variables.
+# Override either via the PARTITION / TIME_LIMIT environment variables. Set
+# MEM_PER_TASK (e.g. "16G") to add an explicit --mem= request - required on
+# clusters where only certain partitions (e.g. himem) accept a memory
+# specification at all; leave it unset on partitions where --mem is rejected
+# or unnecessary. Applies to both the array tasks and the merge job.
 #
 # Each job writes its own uniquely-named file under
 #   $OUT_DIR/summary_parts/*.csv
@@ -22,11 +29,19 @@
 # combines them into $OUT_DIR/summary.csv and $OUT_DIR/confusion_matrices.txt.
 #
 # Usage:
-#   ./run_cluster_slurm.sh [OUT_DIR] [NUM_SWEEP_STEPS] [MAX_CONCURRENT_TASKS] [CORPUS_SIZE]
+#   ./run_cluster_slurm.sh [OUT_DIR] [MAX_CUM_PROP_THRESHOLD] [MAX_CONCURRENT_TASKS] [CORPUS_SIZE]
 #
 #   OUT_DIR                 Where results/logs go. Default: sweep_out
-#   NUM_SWEEP_STEPS          Seed-list-size steps per require_tag_match_true/
-#                            false sweep. Default: 6
+#   MAX_CUM_PROP_THRESHOLD  Cap on the noun seed-list size tested (every
+#                            noun count 1..N is tested, matched against verb
+#                            counts - not a doubling sequence, not a cross
+#                            product) - see compute_seed_steps. Default:
+#                            0.239 (all 33 curated verbs are always matched -
+#                            they cover 23.9% of verb tokens at most - while
+#                            nouns are capped to a comparable ~36-word list
+#                            with the current seed files). Check the
+#                            resulting job count first with
+#                            --print-num-seed-steps before raising this.
 #   MAX_CONCURRENT_TASKS     Optional throttle on simultaneously running
 #                            array tasks (SLURM's --array=1-N%K). Default:
 #                            unthrottled (let the scheduler decide).
@@ -41,10 +56,10 @@
 #                            to subsample the test set too instead.
 #
 # Any extra category_bootstrap.py options (--corpus-file, --noun-seeds-file,
-# --verb-seeds-file, --cum-prop-threshold, --window-size, --test-fraction,
+# --verb-seeds-file, --num-sweep-steps, --window-size, --test-fraction,
 # --split-seed, --subsample-scope) can be set via the EXTRA_ARGS environment
 # variable, e.g.:
-#   EXTRA_ARGS="--window-size 3" ./run_cluster_slurm.sh sweep_out 6
+#   EXTRA_ARGS="--window-size 3" ./run_cluster_slurm.sh sweep_out 0.239
 #
 # REGENERATE_SEEDS  Set to 0 to skip the from_tagged_corpus_to_seeds.py
 #                     preflight step below and submit jobs against whatever
@@ -77,7 +92,7 @@ PYTHON_SCRIPT="$SCRIPT_DIR/category_bootstrap.py"
 SEEDS_SCRIPT="$SCRIPT_DIR/from_tagged_corpus_to_seeds.py"
 
 OUT_DIR="${1:-sweep_out}"
-NUM_SWEEP_STEPS="${2:-6}"
+MAX_CUM_PROP_THRESHOLD="${2:-0.239}"
 MAX_CONCURRENT_TASKS="${3:-}"
 CORPUS_SIZE="${4:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
@@ -85,6 +100,12 @@ REGENERATE_SEEDS="${REGENERATE_SEEDS:-1}"
 
 PARTITION="${PARTITION:-serial}"
 TIME_LIMIT="${TIME_LIMIT:-1-00:00:00}"
+MEM_PER_TASK="${MEM_PER_TASK:-}"
+
+MEM_SBATCH_LINE=""
+if [[ -n "$MEM_PER_TASK" ]]; then
+    MEM_SBATCH_LINE="#SBATCH --mem=$MEM_PER_TASK"
+fi
 
 CORPUS_SIZE_ARGS=""
 if [[ -n "$CORPUS_SIZE" ]]; then
@@ -111,11 +132,20 @@ mkdir -p "$OUT_DIR/summary_parts" "$OUT_DIR/confusion_parts" "$OUT_DIR/logs"
 JOBS_FILE="$OUT_DIR/jobs.txt"
 > "$JOBS_FILE"
 
+# The seed-set sweep is a MATCHED SEQUENCE of (num_nouns, num_verbs) pairs
+# (see compute_seed_steps/--max-cum-prop-threshold in category_bootstrap.py),
+# NOT a cross product, so the number of valid --seed-step values has to be
+# queried rather than assumed. Independent of pattern_type/mode
+# (require_tag_match_true and _false sweep the identical sequence), so this
+# only needs to run once.
+NUM_STEPS="$(python3 "$PYTHON_SCRIPT" --print-num-seed-steps --max-cum-prop-threshold "$MAX_CUM_PROP_THRESHOLD" $EXTRA_ARGS)"
+echo "Seed-set sweep size: $NUM_STEPS pairings (--max-cum-prop-threshold $MAX_CUM_PROP_THRESHOLD, plus any --noun-seeds-file/--verb-seeds-file/--num-sweep-steps overrides in EXTRA_ARGS)."
+
 for pattern_type in 1 2 3; do
-    echo "python3 \"$PYTHON_SCRIPT\" --mode all_tagged_nouns_verbs --pattern-type $pattern_type --out-dir \"$OUT_DIR\" --num-sweep-steps $NUM_SWEEP_STEPS $CORPUS_SIZE_ARGS $EXTRA_ARGS" >> "$JOBS_FILE"
+    echo "python3 \"$PYTHON_SCRIPT\" --mode all_tagged_nouns_verbs --pattern-type $pattern_type --out-dir \"$OUT_DIR\" $CORPUS_SIZE_ARGS $EXTRA_ARGS" >> "$JOBS_FILE"
     for mode in require_tag_match_true require_tag_match_false; do
-        for ((step = 0; step < NUM_SWEEP_STEPS; step++)); do
-            echo "python3 \"$PYTHON_SCRIPT\" --mode $mode --pattern-type $pattern_type --seed-step $step --out-dir \"$OUT_DIR\" --num-sweep-steps $NUM_SWEEP_STEPS $CORPUS_SIZE_ARGS $EXTRA_ARGS" >> "$JOBS_FILE"
+        for ((step = 0; step < NUM_STEPS; step++)); do
+            echo "python3 \"$PYTHON_SCRIPT\" --mode $mode --pattern-type $pattern_type --seed-step $step --out-dir \"$OUT_DIR\" --max-cum-prop-threshold $MAX_CUM_PROP_THRESHOLD $CORPUS_SIZE_ARGS $EXTRA_ARGS" >> "$JOBS_FILE"
         done
     done
 done
@@ -131,6 +161,7 @@ cat > "$TASK_SCRIPT" <<EOF
 #!/usr/bin/env bash
 #SBATCH --partition=$PARTITION
 #SBATCH --time=$TIME_LIMIT
+$MEM_SBATCH_LINE
 #SBATCH --job-name=category_bootstrap
 #SBATCH --output=$OUT_DIR/logs/task_%A_%a.out
 #SBATCH --error=$OUT_DIR/logs/task_%A_%a.err
@@ -150,6 +181,7 @@ cat > "$MERGE_SCRIPT" <<EOF
 #!/usr/bin/env bash
 #SBATCH --partition=$PARTITION
 #SBATCH --time=$TIME_LIMIT
+$MEM_SBATCH_LINE
 #SBATCH --job-name=category_bootstrap_merge
 #SBATCH --output=$OUT_DIR/logs/merge_%j.out
 #SBATCH --error=$OUT_DIR/logs/merge_%j.err

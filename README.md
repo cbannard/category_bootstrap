@@ -6,7 +6,7 @@ Code for bootstrapping words into grammatical categories (NOUN/VERB) from a tagg
 
 - `manchester_input_tagged_trf_word_and_lemma.txt` — raw tagged Manchester corpus, one utterance per line, tokens in `WORD_LEMMA_TAG` format.
 - `manchester_input_tagged_trf_word_and_lemma_postprocessed.txt` — cleaned-up version produced by `from_tagged_corpus_to_seeds.py` (tag/lemma fixups, filler-word normalization, punctuation stripped). This is the file `category_bootstrap.py` actually reads. `be`, `do`, and `have` are retagged away from `VERB` entirely here (blanket exclusion, covering both auxiliary and lexical/main-verb uses), so they never count as verbs anywhere downstream, including `all_tagged_nouns_verbs` mode (which reads tags directly).
-- `noun_selection.xlsx` / `verb_selection.xlsx` — candidate seed words with columns `Word`, `Count`, `Include` (1 = eligible to be used as a seed, 0 = excluded), also produced by `from_tagged_corpus_to_seeds.py`. Noun inclusion is decided via WordNet (`physical entity` hypernym check); verb inclusion is decided by human judgment, read from `verb_inclusion.xlsx`. Only consulted by the `require_tag_match_*` modes - `all_tagged_nouns_verbs` mode ignores these files entirely (see Modes below).
+- `noun_selection.xlsx` / `verb_selection.xlsx` — candidate seed words with columns `Word`, `Count`, `Include` (1 = eligible to be used as a seed, 0 = excluded), also produced by `from_tagged_corpus_to_seeds.py`. Noun inclusion is decided via WordNet (`physical entity` hypernym check), then a proper-noun lemma has `Include` forced back to 0 regardless of that WordNet result (see `--proper-noun-ratio-threshold` below); a `ProperNounRatio` column records the PROPN-tag ratio that decision was based on. `Word` keeps multiword noun lemmas joined with `+` (e.g. `ice+cream`) to stay consistent with how the postprocessed corpus itself is written — the `+`/`_` mismatch against WordNet's own `_`-joined multiword entries is handled at lookup time only, inside `from_tagged_corpus_to_seeds.py`, and doesn't affect corpus matching. Verb inclusion is decided by human judgment, read from `verb_inclusion.xlsx`. Only consulted by the `require_tag_match_*` modes - `all_tagged_nouns_verbs` mode ignores these files entirely (see Modes below). If the same lemma ends up `Include==1` in both files (e.g. "walk"), `category_bootstrap.py` resolves the conflict itself at run time (see `resolve_noun_verb_seed_overlap` below) rather than the files being edited to avoid it.
 - `verb_inclusion.xlsx` — human-curated verb inclusion judgments, columns `lemma`, `root`, `INCLUDE_wordnet`, `INCLUDE_human`. Every lemma here must occur in the corpus's verb list, or `from_tagged_corpus_to_seeds.py` raises an error. `be`/`do`/`have` are deliberately absent - since they're retagged away from `VERB` before this list is built, they'd otherwise trip that same-error check.
 
 ## Pipeline
@@ -17,6 +17,15 @@ Reads the raw corpus, applies tag/token cleanup rules, writes the postprocessed 
 
 ```
 python3 from_tagged_corpus_to_seeds.py
+```
+
+Beyond the tag/token cleanup rules, this script also:
+
+- **Fixes 15 "plurale tantum" lemmatization bugs.** The trf tagger's lemmatizer strips a trailing "s" as if it were always a regular plural marker, which is wrong for English nouns that have no singular form (e.g. "clothes", "scissors", "knickers") — it produces a lemma (`clothe`, `scissor`, `knicker`, ...) that isn't a real word and has no WordNet noun sense, so those tokens were wrongly excluded from the noun seed list. The corrected lemma list, hand-confirmed as real bugs (proper nouns/character names that trip the same detection rule, e.g. "leed"→"leeds"/"thoma"→"thomas"/"hercule"→"hercules"/"missi"→"missis", are deliberately left uncorrected — see the comment above the substitutions): `clothe→clothes`, `knicker→knickers`, `thank→thanks`, `scissor→scissors`, `tight→tights`, `underpant→underpants`, `after→afters`, `gymnastic→gymnastics`, `dramatic→dramatics`, `lazybone→lazybones`, `aerobic→aerobics`, `oasi→oasis`, `acrobatic→acrobatics`, `logistic→logistics`, `tiddlywink→tiddlywinks`. **`detect_fake_singular_lemmas.py`** re-derives this candidate list from scratch (four mechanical conditions: the bare lemma never occurs on its own, ~all occurrences are the "+s" surface form, the bare lemma has no WordNet noun sense, the "+s" form does) — run it after regenerating the postprocessed corpus to check for new candidates; it only prints candidates for manual review, it doesn't apply any fix itself.
+- **Excludes proper nouns/names from the noun seed list.** Before the tagger's `PROPN`→`NOUN` retag collapses the distinction, each lemma's `PROPN` vs. `NOUN` tag counts are tallied. Any lemma tagged `PROPN` at least `--proper-noun-ratio-threshold` (default `0.99`) of the time has `Include` forced to 0 in `noun_selection.xlsx`/`.csv` regardless of what the WordNet check said — since WordNet also lists many proper nouns/named individuals (e.g. "Thomas", "Hercules") as having a noun sense. The ratio is recorded per-lemma in a new `ProperNounRatio` column. The threshold defaults conservatively high (0.99) because this corpus has physical-entity nouns that happen to share a name with a TV/story character (e.g. "teddy" is tagged `PROPN` ~79% of the time, "bear" ~53%) — a lower threshold would wrongly exclude those. The lemma is still retagged to `NOUN` in the postprocessed corpus either way, so it remains a valid tagged noun/target everywhere downstream (`all_tagged_nouns_verbs` mode, corpus-tag scoring, etc.) - only its eligibility as a *seed* is affected.
+
+```
+python3 from_tagged_corpus_to_seeds.py --proper-noun-ratio-threshold 0.99
 ```
 
 ### 2. `category_bootstrap.py`
@@ -30,12 +39,15 @@ It can be run two ways:
 
 Key concepts:
 
-- **Modes**: `all_tagged_nouns_verbs` (extract patterns from every word tagged noun/verb in the postprocessed training corpus itself - noun/verb status is decided purely from each occurrence's own corpus tag, and `noun_selection.xlsx`/`verb_selection.xlsx` are ignored entirely, not just for the noun/verb decision but for which words get used at all), `require_tag_match_true` (a word only counts as a noun/verb seed if it's also tagged that way in the corpus), `require_tag_match_false` (seed list alone decides). The `require_tag_match_*` modes sweep across increasing seed-set sizes (smallest allowed by `--cum-prop-threshold`, doubling `--num-sweep-steps` times).
+- **Modes**: `all_tagged_nouns_verbs` (extract patterns from every word tagged noun/verb in the postprocessed training corpus itself - noun/verb status is decided purely from each occurrence's own corpus tag, and `noun_selection.xlsx`/`verb_selection.xlsx` are ignored entirely, not just for the noun/verb decision but for which words get used at all), `require_tag_match_true` (a word only counts as a noun/verb seed if it's also tagged that way in the corpus), `require_tag_match_false` (seed list alone decides). The `require_tag_match_*` modes sweep across increasing seed-set sizes via `--seed-step` - see Seed-set sweep below.
+- **Seed-set sweep**: `compute_seed_steps` (in `category_bootstrap.py`) returns a MATCHED SEQUENCE of `(num_nouns, num_verbs)` pairs, not a cross product/grid: for each noun count 1..N up to `--max-cum-prop-threshold`'s share of noun tokens, it's paired with whichever verb count(s) cover the matching share of verb tokens, so every noun count in range and every verb count from 0 up to the full curated verb list appear at least once (a noun count occasionally pairs with two verb counts rather than exactly one, to guarantee that verb-count coverage). With the current seed files and the default threshold (0.239) this is 45 pairings (36 noun counts, 9 of which pair with two verb counts). `--seed-step` selects one pairing by its 0-indexed position in this sequence; `--print-num-seed-steps` prints how many pairings exist (i.e. the valid range for `--seed-step`) without running anything else. `--num-sweep-steps` is an optional extra cap on how many noun counts are considered, on top of `--max-cum-prop-threshold`.
+- **Noun/verb seed overlap**: a lemma can legitimately be tagged as both a noun and a verb somewhere in the corpus (e.g. "walk"), so it can end up `Include==1` in both seed files independently. `resolve_noun_verb_seed_overlap` (in `category_bootstrap.py`, run automatically in `main()` before any seed-set-size logic) resolves every such conflict by comparing the word's share of the full noun-token count vs. the full verb-token count, and keeping `Include==1` only in whichever category it's the larger share of (e.g. "walk" at 2% of noun tokens vs. 1% of verb tokens is kept as a noun seed only). This never modifies the seed files on disk - it's applied in-memory every run.
 - **Pattern types**: `--pattern-type 1/2/3`, three different ways of defining the context window pattern around a target word.
 - **Punctuation**: punctuation tokens (anything with no letters, aside from the `{`/`}` sentence-boundary markers) are normalized to a single `PUNCT` placeholder before patterns are built, so e.g. `,` and `.` aren't treated as different context words. `PUNCT` can appear as a context slot in a learned pattern (e.g. `PUNCT_X_noun`), but a punctuation token is never used as the target/filler word (the `X` itself) - only real words (and the `NOUN`/`VERB` abstractions) can fill that position.
 - **Context abstraction**: `--no-abstract-context` (default is abstraction on) controls whether CONTEXT words (not the target word - that's always abstracted) get collapsed to `"noun"`/`"verb"` when they qualify, or are left as their literal surface form. Must be set consistently between the run that built a pattern set and any later categorization pass reusing it, since a pattern like `the_X_noun` won't match anything if context words weren't abstracted when it was built.
-- **Baseline**: every run also reports the score of a random-guess classifier, computed analytically (no simulation needed), for comparison. The guess probabilities come from the training set's own composition (see `compute_seed_tag_guess_probs`): p(NOUN) is the proportion of training word occurrences whose lemma is on the noun seed list AND whose own corpus tag says noun, p(VERB) the proportion on the verb seed list AND tagged a verb, and p(OTHER) everything else — including a seed-list word whose tag disagrees for that particular occurrence (e.g. on the noun seed list but tagged a verb there), which counts as OTHER rather than NOUN. In `all_tagged_nouns_verbs` mode, which has no curated seed list, the occurrence's own corpus tag is used directly instead (NOUN/VERB by tag, same as how that mode already decides noun/verb status everywhere else). Those guess probabilities are then scored against the actual test set.
-- **Corpus size**: `--corpus-size` randomly subsamples the corpus down to that many sentences instead of using the full corpus (deterministic given `--split-seed`). By default (`--subsample-scope train_only`) only the training pool is subsampled — the held-out test set is always the same fixed sentences regardless of corpus size, so results across different sizes are comparable against one fixed test set. `--subsample-scope whole_corpus` instead subsamples the full corpus before splitting, so the test set shrinks and changes between sizes too.
+- **Baseline**: every run also reports the score of a random-guess classifier, computed analytically (no simulation needed), for comparison. The guess probabilities come from the training set's own composition (see `compute_seed_tag_guess_probs`), using the same noun/verb criterion as the run itself: in `require_tag_match_true` mode, p(NOUN) is the proportion of training word occurrences whose lemma is on the noun seed list AND whose own corpus tag says noun (p(VERB) likewise for the verb seed list/tag) — a seed-list word whose tag disagrees for that particular occurrence counts as OTHER, not NOUN. In `require_tag_match_false` mode, seed-list membership alone decides NOUN/VERB, regardless of the occurrence's own tag. In `all_tagged_nouns_verbs` mode, which has no curated seed list, the occurrence's own corpus tag is used directly instead (NOUN/VERB by tag, same as how that mode already decides noun/verb status everywhere else). p(OTHER) is whatever's left over in each case. Those guess probabilities are then scored against the actual test set.
+- **Corpus size**: `--corpus-size` randomly subsamples the corpus down to that many sentences instead of using the full corpus (deterministic given `--split-seed`). Only relevant when `--n-folds 1`; by default (`--subsample-scope train_only`) only the training pool is subsampled — the held-out test set is always the same fixed sentences regardless of corpus size, so results across different sizes are comparable against one fixed test set. `--subsample-scope whole_corpus` instead subsamples the full corpus before splitting, so the test set shrinks and changes between sizes too. Under cross-validation (`--n-folds` > 1, the default) `--corpus-size` always subsamples the whole pool before folding, regardless of `--subsample-scope`.
+- **Cross-validation**: `--n-folds` (default 5) runs k-fold cross-validation internally within a single process/job - every sentence is used as the test set exactly once, across `--n-folds` independent train/test splits. `summary.csv` gets one row per fold plus a `mean` row (mean + std across folds); `learned_patterns_*`/`confusion_words_*`/`pattern_usage_*` are written once per fold (filenames get a `_foldN` suffix). Pass `--n-folds 1` to instead reproduce the original single 80/20-style split (one run, no fold suffix, no mean row) — `--test-fraction`/`--split-seed`/`--subsample-scope` only take effect in that case.
 
 Useful flags (see `python3 category_bootstrap.py --help` for the full list):
 
@@ -43,18 +55,21 @@ Useful flags (see `python3 category_bootstrap.py --help` for the full list):
 |---|---|---|
 | `--mode` | (none = full comparison) | `all_tagged_nouns_verbs` / `require_tag_match_true` / `require_tag_match_false` |
 | `--pattern-type` | 1 | 1, 2, or 3 |
-| `--seed-step` | (none) | 0-indexed seed-set size step; required for `require_tag_match_*` single-job mode |
-| `--num-sweep-steps` | 6 | number of doubling steps in the seed-set sweep |
-| `--cum-prop-threshold` | 0.1 | cumulative-frequency threshold used to pick the smallest seed-set size |
+| `--seed-step` | (none) | 0-indexed position in the seed-set sweep sequence; required for `require_tag_match_*` single-job mode |
+| `--max-cum-prop-threshold` | 0.239 | cap on the noun seed-list size tested, as cumulative proportion of noun tokens; also indirectly caps how many verb counts get matched. See Seed-set sweep above. |
+| `--num-sweep-steps` | (none) | optional EXTRA cap on how many noun counts are considered, on top of `--max-cum-prop-threshold` |
+| `--print-num-seed-steps` | off | print the number of `(num_nouns, num_verbs)` pairings (i.e. the valid `--seed-step` range) for the given seed files/threshold, then exit immediately - skips loading/splitting the corpus |
 | `--window-size` | 2 | context window size (tokens either side of the target) |
+| `--no-abstract-context` | off (abstraction on) | disable noun/verb abstraction of CONTEXT words - see Context abstraction above |
+| `--emit-target-words` | off | also write a `learned_patterns_words_*.xlsx` with the target's literal surface word always kept (never collapsed to NOUN/VERB) alongside its NOUN/VERB/OTHER category - purely an extra reporting output, doesn't affect any evaluation metric |
 | `--out-dir` | `sweep_out` | output directory |
 | `--corpus-file` | `manchester_input_tagged_trf_word_and_lemma_postprocessed.txt` | corpus to read |
 | `--noun-seeds-file` / `--verb-seeds-file` | `noun_selection.xlsx` / `verb_selection.xlsx` | seed files |
-| `--test-fraction` | 0.2 | fraction of sentences held out for testing |
+| `--n-folds` | 5 | number of folds for k-fold cross-validation; `--n-folds 1` runs a single 80/20-style split instead - see Cross-validation above |
+| `--test-fraction` | 0.2 | fraction of sentences held out for testing (only used when `--n-folds 1`) |
 | `--split-seed` | 42 | RNG seed for the train/test split (keeps the split identical across independent processes) |
 | `--corpus-size` | (none = full corpus) | randomly subsample the corpus down to this many sentences |
-| `--subsample-scope` | `train_only` | `train_only` (fixed test set across corpus sizes) or `whole_corpus` (test set also shrinks) — only matters when `--corpus-size` is given |
-| `--no-abstract-context` | off (abstraction on) | disable noun/verb abstraction of CONTEXT words - see Context abstraction above |
+| `--subsample-scope` | `train_only` | `train_only` (fixed test set across corpus sizes) or `whole_corpus` (test set also shrinks) — only matters when `--corpus-size` is given and `--n-folds 1` |
 | `--merge` | off | merge `summary_parts`/`confusion_parts` into the final output files, then exit |
 
 Example — run everything in one process:
@@ -80,12 +95,12 @@ python3 category_bootstrap.py --merge --out-dir sweep_out
 
 ## Running the full comparison on a cluster
 
-The full mode × pattern-type comparison (3 pattern types × (1 `all_tagged_nouns_verbs` + `--num-sweep-steps` `require_tag_match_true` + `--num-sweep-steps` `require_tag_match_false`) runs — 39 jobs with the defaults) can be dispatched as many independent single-job processes instead of running sequentially in one process.
+The full mode × pattern-type comparison (3 pattern types × (1 `all_tagged_nouns_verbs` + N `require_tag_match_true` + N `require_tag_match_false`) runs, where N is the number of `(num_nouns, num_verbs)` pairings from `compute_seed_steps` - a MATCHED SEQUENCE, not a cross product/grid, queried fresh each run via `--print-num-seed-steps` since it depends on the actual seed files - currently 45 pairings with the default `--max-cum-prop-threshold 0.239`, i.e. 3 × (1 + 45 + 45) = 273 jobs) can be dispatched as many independent single-job processes instead of running sequentially in one process. Each job also runs `--n-folds` (default 5) k-fold cross-validation internally, so expect roughly 5× the runtime and roughly 5× the per-job `learned_patterns_*`/`confusion_words_*`/`pattern_usage_*` files (one set per fold) compared to a single 80/20 split; pass `EXTRA_ARGS="--n-folds 1"` to reproduce the original single-split behavior instead.
 
 Both cluster scripts run a preflight step before dispatching any jobs: by default (`REGENERATE_SEEDS=1`, the default) they rerun `from_tagged_corpus_to_seeds.py` to regenerate the postprocessed corpus and `noun_selection.csv`/`verb_selection.csv`, then refresh `noun_selection.xlsx`/`verb_selection.xlsx` from those `.csv` files - so a sweep never silently runs against a stale postprocessed corpus or seed list (e.g. after editing `from_tagged_corpus_to_seeds.py`'s tag cleanup rules or `verb_inclusion.xlsx`'s `Include` judgments). Set `REGENERATE_SEEDS=0` to skip this and dispatch against whatever's already on disk instead (useful if you've already regenerated things yourself, or want to avoid the network-dependent wordnet/`wn` lexicon download on every run). In `run_cluster_slurm.sh` this runs once on the submission host, before any `sbatch` call, since compute nodes may lack the network access the one-time wordnet/`wn` download needs.
 
 ```
-REGENERATE_SEEDS=0 ./run_cluster.sh sweep_out 6 8
+REGENERATE_SEEDS=0 ./run_cluster.sh sweep_out 0.239 8
 ```
 
 ### `run_cluster.sh` — local / any-scheduler parallel dispatch
@@ -93,19 +108,20 @@ REGENERATE_SEEDS=0 ./run_cluster.sh sweep_out 6 8
 Runs all jobs via `xargs -P`, using as many workers as requested (default: all cores), then merges.
 
 ```
-./run_cluster.sh [OUT_DIR] [NUM_SWEEP_STEPS] [JOBS] [CORPUS_SIZE]
+./run_cluster.sh [OUT_DIR] [MAX_CUM_PROP_THRESHOLD] [JOBS] [CORPUS_SIZE]
 ```
 
 - `OUT_DIR` — default `sweep_out`
-- `NUM_SWEEP_STEPS` — default 6
-- `JOBS` — default: number of cores (`nproc`)
+- `MAX_CUM_PROP_THRESHOLD` — cap on the noun seed-list size tested, as cumulative proportion of noun tokens (see `--max-cum-prop-threshold`/Seed-set sweep above). Default 0.239 (chosen so all 33 curated verbs are always matched - they cover 23.9% of verb tokens at most - while nouns are capped to a comparable ~36-word list with the current seed files). Check the resulting job count first with `--print-num-seed-steps` before raising this.
+- `JOBS` — default: number of cores (`nproc`), or 4 if unavailable
 - `CORPUS_SIZE` — optional; forwarded as `--corpus-size` to every job. Default: unset, i.e. full corpus.
 
-Extra `category_bootstrap.py` flags (including `--subsample-scope`) can be forwarded to every job via the `EXTRA_ARGS` environment variable:
+Extra `category_bootstrap.py` flags (`--corpus-file`, `--noun-seeds-file`, `--verb-seeds-file`, `--num-sweep-steps`, `--window-size`, `--n-folds`, `--test-fraction`, `--split-seed`, `--subsample-scope`) can be forwarded to every job via the `EXTRA_ARGS` environment variable:
 
 ```
-EXTRA_ARGS="--window-size 3" ./run_cluster.sh sweep_out 6 8
-EXTRA_ARGS="--subsample-scope whole_corpus" ./run_cluster.sh sweep_out 6 8 5000
+EXTRA_ARGS="--window-size 3" ./run_cluster.sh sweep_out 0.239 8
+EXTRA_ARGS="--n-folds 1" ./run_cluster.sh sweep_out 0.239 8   # old single-split behavior
+EXTRA_ARGS="--subsample-scope whole_corpus" ./run_cluster.sh sweep_out 0.239 8 5000
 ```
 
 ### `run_cluster_slurm.sh` — SLURM job array
@@ -113,15 +129,23 @@ EXTRA_ARGS="--subsample-scope whole_corpus" ./run_cluster.sh sweep_out 6 8 5000
 Generates the same job list, then submits it as a SLURM array job (one array task per job) on the `serial` partition with a 1-day time limit, followed by a dependent merge job that only runs once the whole array has completed successfully.
 
 ```
-./run_cluster_slurm.sh [OUT_DIR] [NUM_SWEEP_STEPS] [MAX_CONCURRENT_TASKS] [CORPUS_SIZE]
+./run_cluster_slurm.sh [OUT_DIR] [MAX_CUM_PROP_THRESHOLD] [MAX_CONCURRENT_TASKS] [CORPUS_SIZE]
 ```
 
 - `OUT_DIR` — default `sweep_out`
-- `NUM_SWEEP_STEPS` — default 6
+- `MAX_CUM_PROP_THRESHOLD` — same meaning/default (0.239) as in `run_cluster.sh` above
 - `MAX_CONCURRENT_TASKS` — optional throttle on simultaneously running array tasks (`--array=1-N%K`); default unthrottled
 - `CORPUS_SIZE` — optional; forwarded as `--corpus-size` to every job. Default: unset, i.e. full corpus.
 
-Override the partition/time limit via the `PARTITION` / `TIME_LIMIT` environment variables (defaults: `serial` / `1-00:00:00`). `EXTRA_ARGS` works the same as in `run_cluster.sh` (e.g. `EXTRA_ARGS="--subsample-scope whole_corpus"` to also shrink the test set as corpus size shrinks). The script only submits jobs and returns immediately — track progress with `squeue -u $USER`; results land in `<out-dir>/summary.csv` and `confusion_matrices.txt` once the merge job finishes. Per-task logs go to `<out-dir>/logs/`.
+Override the partition/time limit via the `PARTITION` / `TIME_LIMIT` environment variables (defaults: `serial` / `1-00:00:00`). Set `MEM_PER_TASK` (e.g. `16G`) to add an explicit `--mem=` request to every array task and the merge job - needed on clusters where only certain partitions accept a memory specification at all (e.g. a `himem` partition); leave it unset on partitions where `--mem` is rejected or unnecessary. `EXTRA_ARGS` works the same as in `run_cluster.sh`. The script only submits jobs and returns immediately — track progress with `squeue -u $USER`; results land in `<out-dir>/summary.csv` and `confusion_matrices.txt` once the merge job finishes. Per-task logs go to `<out-dir>/logs/`.
+
+Example — full sweep with full cross-validation on a `himem` partition requiring an explicit memory request:
+
+```
+PARTITION=himem MEM_PER_TASK=32G ./run_cluster_slurm.sh sweep_out 0.239
+```
+
+This script was written and syntax-checked without access to a real SLURM scheduler, so it's worth a dry run (e.g. with a small `--array` throttle, or checking `jobs.txt`/`--print-num-seed-steps` first) before trusting it for a long sweep.
 
 ## Notebooks
 

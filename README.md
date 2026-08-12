@@ -40,7 +40,7 @@ It can be run two ways:
 Key concepts:
 
 - **Modes**: `all_tagged_nouns_verbs` (extract patterns from every word tagged noun/verb in the postprocessed training corpus itself - noun/verb status is decided purely from each occurrence's own corpus tag, and `noun_selection.xlsx`/`verb_selection.xlsx` are ignored entirely, not just for the noun/verb decision but for which words get used at all), `require_tag_match_true` (a word only counts as a noun/verb seed if it's also tagged that way in the corpus), `require_tag_match_false` (seed list alone decides). The `require_tag_match_*` modes sweep across increasing seed-set sizes via `--seed-step` - see Seed-set sweep below.
-- **Seed-set sweep**: `compute_seed_steps` (in `category_bootstrap.py`) returns a MATCHED SEQUENCE of `(num_nouns, num_verbs)` pairs, not a cross product/grid: for each noun count 1..N up to `--max-cum-prop-threshold`'s share of noun tokens, it's paired with whichever verb count(s) cover the matching share of verb tokens, so every noun count in range and every verb count from 0 up to the full curated verb list appear at least once (a noun count occasionally pairs with two verb counts rather than exactly one, to guarantee that verb-count coverage). With the current seed files and the default threshold (0.239) this is 45 pairings (36 noun counts, 9 of which pair with two verb counts). `--seed-step` selects one pairing by its 0-indexed position in this sequence; `--print-num-seed-steps` prints how many pairings exist (i.e. the valid range for `--seed-step`) without running anything else. `--num-sweep-steps` is an optional extra cap on how many noun counts are considered, on top of `--max-cum-prop-threshold`.
+- **Seed-set sweep**: `compute_seed_steps` (in `category_bootstrap.py`) returns a MATCHED SEQUENCE of `(num_nouns, num_verbs)` pairs, not a cross product/grid: for each noun count 1..N up to `--max-cum-prop-threshold`'s share of noun tokens, it's paired with whichever verb count(s) cover the matching share of verb tokens, so every noun count in range and every verb count from 0 up to the full curated verb list appear at least once (a noun count can in principle pair with more than one verb count, to guarantee that verb-count coverage, though with the current seed files every noun count happens to pair with exactly one). With the current seed files and the default threshold (0.45) this is 139 pairings (139 noun counts). `--seed-step` selects one pairing by its 0-indexed position in this sequence; `--print-num-seed-steps` prints how many pairings exist (i.e. the valid range for `--seed-step`) without running anything else. `--num-sweep-steps` is an optional extra cap on how many noun counts are considered, on top of `--max-cum-prop-threshold`. The default threshold is set just above the current seed files' actual verb-token coverage ceiling (33 curated verbs cover 44.7% of verb tokens, not the corpus's own fixed property — it depends entirely on `verb_selection.xlsx`'s `Include` column) so the sweep always exhausts the full verb list; re-derive this figure and update the default if the verb seed list changes.
 - **Noun/verb seed overlap**: a lemma can legitimately be tagged as both a noun and a verb somewhere in the corpus (e.g. "walk"), so it can end up `Include==1` in both seed files independently. `resolve_noun_verb_seed_overlap` (in `category_bootstrap.py`, run automatically in `main()` before any seed-set-size logic) resolves every such conflict by comparing the word's share of the full noun-token count vs. the full verb-token count, and keeping `Include==1` only in whichever category it's the larger share of (e.g. "walk" at 2% of noun tokens vs. 1% of verb tokens is kept as a noun seed only). This never modifies the seed files on disk - it's applied in-memory every run.
 - **Pattern types**: `--pattern-type 1/2/3`, three different ways of defining the context window pattern around a target word.
 - **Punctuation**: punctuation tokens (anything with no letters, aside from the `{`/`}` sentence-boundary markers) are normalized to a single `PUNCT` placeholder before patterns are built, so e.g. `,` and `.` aren't treated as different context words. `PUNCT` can appear as a context slot in a learned pattern (e.g. `PUNCT_X_noun`), but a punctuation token is never used as the target/filler word (the `X` itself) - only real words (and the `NOUN`/`VERB` abstractions) can fill that position.
@@ -56,7 +56,7 @@ Useful flags (see `python3 category_bootstrap.py --help` for the full list):
 | `--mode` | (none = full comparison) | `all_tagged_nouns_verbs` / `require_tag_match_true` / `require_tag_match_false` |
 | `--pattern-type` | 1 | 1, 2, or 3 |
 | `--seed-step` | (none) | 0-indexed position in the seed-set sweep sequence; required for `require_tag_match_*` single-job mode |
-| `--max-cum-prop-threshold` | 0.239 | cap on the noun seed-list size tested, as cumulative proportion of noun tokens; also indirectly caps how many verb counts get matched. See Seed-set sweep above. |
+| `--max-cum-prop-threshold` | 0.45 | cap on the noun seed-list size tested, as cumulative proportion of noun tokens; also indirectly caps how many verb counts get matched. See Seed-set sweep above. |
 | `--num-sweep-steps` | (none) | optional EXTRA cap on how many noun counts are considered, on top of `--max-cum-prop-threshold` |
 | `--print-num-seed-steps` | off | print the number of `(num_nouns, num_verbs)` pairings (i.e. the valid `--seed-step` range) for the given seed files/threshold, then exit immediately - skips loading/splitting the corpus |
 | `--window-size` | 2 | context window size (tokens either side of the target) |
@@ -95,12 +95,12 @@ python3 category_bootstrap.py --merge --out-dir sweep_out
 
 ## Running the full comparison on a cluster
 
-The full mode × pattern-type comparison (3 pattern types × (1 `all_tagged_nouns_verbs` + N `require_tag_match_true` + N `require_tag_match_false`) runs, where N is the number of `(num_nouns, num_verbs)` pairings from `compute_seed_steps` - a MATCHED SEQUENCE, not a cross product/grid, queried fresh each run via `--print-num-seed-steps` since it depends on the actual seed files - currently 45 pairings with the default `--max-cum-prop-threshold 0.239`, i.e. 3 × (1 + 45 + 45) = 273 jobs) can be dispatched as many independent single-job processes instead of running sequentially in one process. Each job also runs `--n-folds` (default 5) k-fold cross-validation internally, so expect roughly 5× the runtime and roughly 5× the per-job `learned_patterns_*`/`confusion_words_*`/`pattern_usage_*` files (one set per fold) compared to a single 80/20 split; pass `EXTRA_ARGS="--n-folds 1"` to reproduce the original single-split behavior instead.
+The full mode × pattern-type comparison (3 pattern types × (1 `all_tagged_nouns_verbs` + N `require_tag_match_true` + N `require_tag_match_false`) runs, where N is the number of `(num_nouns, num_verbs)` pairings from `compute_seed_steps` - a MATCHED SEQUENCE, not a cross product/grid, queried fresh each run via `--print-num-seed-steps` since it depends on the actual seed files - currently 139 pairings with the default `--max-cum-prop-threshold 0.45`, i.e. 3 × (1 + 139 + 139) = 837 jobs) can be dispatched as many independent single-job processes instead of running sequentially in one process. Each job also runs `--n-folds` (default 5) k-fold cross-validation internally, so expect roughly 5× the runtime and roughly 5× the per-job `learned_patterns_*`/`confusion_words_*`/`pattern_usage_*` files (one set per fold) compared to a single 80/20 split; pass `EXTRA_ARGS="--n-folds 1"` to reproduce the original single-split behavior instead.
 
 Both cluster scripts run a preflight step before dispatching any jobs: by default (`REGENERATE_SEEDS=1`, the default) they rerun `from_tagged_corpus_to_seeds.py` to regenerate the postprocessed corpus and `noun_selection.csv`/`verb_selection.csv`, then refresh `noun_selection.xlsx`/`verb_selection.xlsx` from those `.csv` files - so a sweep never silently runs against a stale postprocessed corpus or seed list (e.g. after editing `from_tagged_corpus_to_seeds.py`'s tag cleanup rules or `verb_inclusion.xlsx`'s `Include` judgments). Set `REGENERATE_SEEDS=0` to skip this and dispatch against whatever's already on disk instead (useful if you've already regenerated things yourself, or want to avoid the network-dependent wordnet/`wn` lexicon download on every run). In `run_cluster_slurm.sh` this runs once on the submission host, before any `sbatch` call, since compute nodes may lack the network access the one-time wordnet/`wn` download needs.
 
 ```
-REGENERATE_SEEDS=0 ./run_cluster.sh sweep_out 0.239 8
+REGENERATE_SEEDS=0 ./run_cluster.sh sweep_out 0.45 8
 ```
 
 ### `run_cluster.sh` — local / any-scheduler parallel dispatch
@@ -112,16 +112,16 @@ Runs all jobs via `xargs -P`, using as many workers as requested (default: all c
 ```
 
 - `OUT_DIR` — default `sweep_out`
-- `MAX_CUM_PROP_THRESHOLD` — cap on the noun seed-list size tested, as cumulative proportion of noun tokens (see `--max-cum-prop-threshold`/Seed-set sweep above). Default 0.239 (chosen so all 33 curated verbs are always matched - they cover 23.9% of verb tokens at most - while nouns are capped to a comparable ~36-word list with the current seed files). Check the resulting job count first with `--print-num-seed-steps` before raising this.
+- `MAX_CUM_PROP_THRESHOLD` — cap on the noun seed-list size tested, as cumulative proportion of noun tokens (see `--max-cum-prop-threshold`/Seed-set sweep above). Default 0.45 (chosen so all 33 curated verbs are always matched - they cover 44.7% of verb tokens at most WITH THE CURRENT SEED FILES - while nouns are capped to a comparable ~139-word list). This depends on `verb_selection.xlsx`'s `Include` column, not on the corpus itself - re-derive it if the verb seed list changes. Check the resulting job count first with `--print-num-seed-steps` before raising this.
 - `JOBS` — default: number of cores (`nproc`), or 4 if unavailable
 - `CORPUS_SIZE` — optional; forwarded as `--corpus-size` to every job. Default: unset, i.e. full corpus.
 
 Extra `category_bootstrap.py` flags (`--corpus-file`, `--noun-seeds-file`, `--verb-seeds-file`, `--num-sweep-steps`, `--window-size`, `--n-folds`, `--test-fraction`, `--split-seed`, `--subsample-scope`) can be forwarded to every job via the `EXTRA_ARGS` environment variable:
 
 ```
-EXTRA_ARGS="--window-size 3" ./run_cluster.sh sweep_out 0.239 8
-EXTRA_ARGS="--n-folds 1" ./run_cluster.sh sweep_out 0.239 8   # old single-split behavior
-EXTRA_ARGS="--subsample-scope whole_corpus" ./run_cluster.sh sweep_out 0.239 8 5000
+EXTRA_ARGS="--window-size 3" ./run_cluster.sh sweep_out 0.45 8
+EXTRA_ARGS="--n-folds 1" ./run_cluster.sh sweep_out 0.45 8   # old single-split behavior
+EXTRA_ARGS="--subsample-scope whole_corpus" ./run_cluster.sh sweep_out 0.45 8 5000
 ```
 
 ### `run_cluster_slurm.sh` — SLURM job array
@@ -133,7 +133,7 @@ Generates the same job list, then submits it as a SLURM array job (one array tas
 ```
 
 - `OUT_DIR` — default `sweep_out`
-- `MAX_CUM_PROP_THRESHOLD` — same meaning/default (0.239) as in `run_cluster.sh` above
+- `MAX_CUM_PROP_THRESHOLD` — same meaning/default (0.45) as in `run_cluster.sh` above
 - `MAX_CONCURRENT_TASKS` — optional throttle on simultaneously running array tasks (`--array=1-N%K`); default unthrottled
 - `CORPUS_SIZE` — optional; forwarded as `--corpus-size` to every job. Default: unset, i.e. full corpus.
 
@@ -142,7 +142,7 @@ Override the partition/time limit via the `PARTITION` / `TIME_LIMIT` environment
 Example — full sweep with full cross-validation on a `himem` partition requiring an explicit memory request:
 
 ```
-PARTITION=himem MEM_PER_TASK=32G ./run_cluster_slurm.sh sweep_out 0.239
+PARTITION=himem MEM_PER_TASK=32G ./run_cluster_slurm.sh sweep_out 0.45
 ```
 
 This script was written and syntax-checked without access to a real SLURM scheduler, so it's worth a dry run (e.g. with a small `--array` throttle, or checking `jobs.txt`/`--print-num-seed-steps` first) before trusting it for a long sweep.

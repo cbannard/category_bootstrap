@@ -19,17 +19,23 @@
 #   --print-num-seed-steps) - NOT a cross product/grid. For every noun count
 #   1..N below MAX_CUM_PROP_THRESHOLD's share of noun tokens, it's paired
 #   with whichever verb count(s) cover the matching share of verb tokens
-#   (most noun counts pair with exactly one verb count; a few pair with two,
-#   so every verb count from 0 up to the full curated list ends up covered
-#   somewhere). With the default MAX_CUM_PROP_THRESHOLD=0.239, that's
-#   currently 45 pairings (36 noun counts, 9 of which contribute 2 pairings
-#   each) - i.e. 3 * (1 + 45 + 45) = 273 jobs - but it depends on the actual
-#   seed files, so it's computed fresh each run rather than hardcoded here.
-#   This grows with MAX_CUM_PROP_THRESHOLD (roughly linearly in the noun
-#   count, not multiplicatively) - run with --print-num-seed-steps first to
-#   check before committing a cluster to it.
+#   (currently every noun count pairs with exactly one verb count with the
+#   current seed files, though a different seed file/threshold can produce
+#   noun counts that pair with two or more, so every verb count from 0 up to
+#   the full curated list ends up covered somewhere). With the default
+#   MAX_CUM_PROP_THRESHOLD=0.45, that's currently 139 pairings (139 noun
+#   counts) - i.e. 3 * (1 + 139 + 139) = 837 jobs - but it depends on the
+#   actual seed files, so it's computed fresh each run rather than
+#   hardcoded here. This grows with MAX_CUM_PROP_THRESHOLD (roughly linearly
+#   in the noun count, not multiplicatively) - run with
+#   --print-num-seed-steps first to check before committing a cluster to
+#   it. The default (0.45) is set just above the current seed files' actual
+#   verb coverage ceiling (33 curated verbs cover 44.7% of verb tokens) so
+#   the sweep always reaches the full verb list - re-derive this if the
+#   verb seed list changes; an earlier default (0.239) was based on a
+#   miscalculated 23.9% figure and only reached verb count 3 of 33.
 #
-# EACH of those 39 jobs now runs category_bootstrap.py's --n-folds (default
+# EACH of those 837 jobs now runs category_bootstrap.py's --n-folds (default
 # 5) k-fold cross-validation internally by itself - i.e. each job trains/
 # tests 5 times (once per fold) instead of once, so expect roughly 5x the
 # runtime and roughly 5x the learned_patterns_*/confusion_words_*/
@@ -58,13 +64,16 @@
 #                            noun count 1..N is tested, matched against
 #                            verb counts - not a doubling sequence, not a
 #                            cross product) - see compute_seed_steps.
-#                            Default: 0.239 (chosen so all 33 curated verbs
-#                            are always matched - they cover 23.9% of verb
-#                            tokens at most - while nouns are capped to a
-#                            comparable ~36-word list with the current seed
-#                            files). Check the resulting job count first
-#                            with --print-num-seed-steps (see above) before
-#                            raising this.
+#                            Default: 0.45 (chosen so all 33 curated verbs
+#                            are always matched - they cover 44.7% of verb
+#                            tokens at most WITH THE CURRENT SEED FILES -
+#                            while nouns are capped to a comparable
+#                            ~139-word list). This depends on
+#                            verb_selection.xlsx's Include column, not on
+#                            the corpus itself - re-derive it if the verb
+#                            seed list changes. Check the resulting job
+#                            count first with --print-num-seed-steps (see
+#                            above) before raising this.
 #   JOBS                    How many jobs to run at once (e.g. number of
 #                            cores). Default: number of cores on this
 #                            machine (nproc), or 4 if nproc isn't available.
@@ -80,9 +89,9 @@
 # --verb-seeds-file, --num-sweep-steps, --window-size, --n-folds,
 # --test-fraction, --split-seed, --subsample-scope) can be set via the
 # EXTRA_ARGS environment variable, e.g.:
-#   EXTRA_ARGS="--window-size 3" ./run_cluster.sh sweep_out 0.239 8
-#   EXTRA_ARGS="--n-folds 10" ./run_cluster.sh sweep_out 0.239 8
-#   EXTRA_ARGS="--n-folds 1" ./run_cluster.sh sweep_out 0.239 8   # old single-split behavior
+#   EXTRA_ARGS="--window-size 3" ./run_cluster.sh sweep_out 0.45 8
+#   EXTRA_ARGS="--n-folds 10" ./run_cluster.sh sweep_out 0.45 8
+#   EXTRA_ARGS="--n-folds 1" ./run_cluster.sh sweep_out 0.45 8   # old single-split behavior
 #   EXTRA_ARGS="--num-sweep-steps 50" ./run_cluster.sh sweep_out 0.5 8   # extra safety cap
 #
 # On a SLURM (or similar) cluster, replace the `xargs -P "$JOBS"` line below
@@ -109,7 +118,7 @@ PYTHON_SCRIPT="$SCRIPT_DIR/category_bootstrap.py"
 SEEDS_SCRIPT="$SCRIPT_DIR/from_tagged_corpus_to_seeds.py"
 
 OUT_DIR="${1:-sweep_out}"
-MAX_CUM_PROP_THRESHOLD="${2:-0.239}"
+MAX_CUM_PROP_THRESHOLD="${2:-0.45}"
 if command -v nproc >/dev/null 2>&1; then
     DEFAULT_JOBS="$(nproc)"
 else

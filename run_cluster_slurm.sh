@@ -36,12 +36,15 @@
 #                            noun count 1..N is tested, matched against verb
 #                            counts - not a doubling sequence, not a cross
 #                            product) - see compute_seed_steps. Default:
-#                            0.239 (all 33 curated verbs are always matched -
-#                            they cover 23.9% of verb tokens at most - while
-#                            nouns are capped to a comparable ~36-word list
-#                            with the current seed files). Check the
-#                            resulting job count first with
-#                            --print-num-seed-steps before raising this.
+#                            0.45 (all 33 curated verbs are always matched -
+#                            they cover 44.7% of verb tokens at most WITH THE
+#                            CURRENT SEED FILES - while nouns are capped to a
+#                            comparable ~139-word list). This depends on
+#                            verb_selection.xlsx's Include column, not on the
+#                            corpus itself - re-derive it if the verb seed
+#                            list changes. Check the resulting job count
+#                            first with --print-num-seed-steps before raising
+#                            this.
 #   MAX_CONCURRENT_TASKS     Optional throttle on simultaneously running
 #                            array tasks (SLURM's --array=1-N%K). Default:
 #                            unthrottled (let the scheduler decide).
@@ -59,7 +62,7 @@
 # --verb-seeds-file, --num-sweep-steps, --window-size, --test-fraction,
 # --split-seed, --subsample-scope) can be set via the EXTRA_ARGS environment
 # variable, e.g.:
-#   EXTRA_ARGS="--window-size 3" ./run_cluster_slurm.sh sweep_out 0.239
+#   EXTRA_ARGS="--window-size 3" ./run_cluster_slurm.sh sweep_out 0.45
 #
 # REGENERATE_SEEDS  Set to 0 to skip the from_tagged_corpus_to_seeds.py
 #                     preflight step below and submit jobs against whatever
@@ -92,7 +95,7 @@ PYTHON_SCRIPT="$SCRIPT_DIR/category_bootstrap.py"
 SEEDS_SCRIPT="$SCRIPT_DIR/from_tagged_corpus_to_seeds.py"
 
 OUT_DIR="${1:-sweep_out}"
-MAX_CUM_PROP_THRESHOLD="${2:-0.239}"
+MAX_CUM_PROP_THRESHOLD="${2:-0.45}"
 MAX_CONCURRENT_TASKS="${3:-}"
 CORPUS_SIZE="${4:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"

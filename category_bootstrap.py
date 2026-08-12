@@ -1038,7 +1038,7 @@ def compute_all_tagged_counts(train_words, train_tags):
 
 
 def compute_seed_steps(noun_seeds_df, verb_seeds_df,
-                        max_cum_prop_threshold=0.239, max_sweep_steps=None):
+                        max_cum_prop_threshold=0.45, max_sweep_steps=None):
     """
     Filters both seed dataframes down to Include==1 (only words eligible to
     be seeds), recomputes cumulative proportion on that filtered,
@@ -1072,10 +1072,12 @@ def compute_seed_steps(noun_seeds_df, verb_seeds_df,
     when verb granularity is locally finer than noun granularity. That's
     exactly why some noun counts end up paired with MORE THAN ONE verb count
     (two or more verb breakpoints landing in the same noun step's window)
-    rather than every noun mapping to exactly one verb - e.g. with the
-    current seed files/default threshold, noun counts 28-36 each pair with
-    two verb counts while 1-27 each pair with one, for 45 total pairings
-    (36 noun counts, 9 of which contribute 2 pairings each).
+    rather than every noun mapping to exactly one verb - with the current
+    seed files/default threshold every noun count happens to pair with
+    exactly one verb count, for 139 total pairings (139 noun counts), but
+    that 1:1 shape is a property of the current data, not guaranteed - a
+    different seed file/threshold can produce noun counts that pair with
+    two or more verb counts.
 
     max_sweep_steps (None by default): an optional EXTRA cap on how many
     noun counts are considered - only noun counts 1..min(N, max_sweep_steps)
@@ -1089,10 +1091,17 @@ def compute_seed_steps(noun_seeds_df, verb_seeds_df,
     matched up to whatever proportion the noun side reaches. Note a small,
     curated seed list (e.g. this pipeline's 33 human-approved verbs) can max
     out well before reaching max_cum_prop_threshold - e.g. all 33 verbs
-    together cover only 23.9% of verb tokens, so raising
-    max_cum_prop_threshold past that point only grows the noun side further,
-    with every extra noun count then pairing with verb count 33 (the full
-    verb list) since there are no higher verb breakpoints left to match.
+    together cover 44.7% of verb tokens with the current seed files
+    (VERIFY THIS AGAINST YOUR OWN SEED FILES - it depends entirely on
+    verb_selection.xlsx's Include column and isn't a fixed corpus property),
+    so raising max_cum_prop_threshold past that point only grows the noun
+    side further, with every extra noun count then pairing with verb count
+    33 (the full verb list) since there are no higher verb breakpoints left
+    to match. Default 0.45 is set just above that 44.7% figure specifically
+    so the sweep always exhausts the full curated verb list (see
+    --max-cum-prop-threshold's CLI help for the exact reasoning) - if the
+    seed files change, re-derive this number rather than assuming it still
+    holds.
 
     Returns (steps, noun_seeds_df, verb_seeds_df):
       - steps: a list of (num_nouns, num_verbs) tuples, ordered by
@@ -1370,7 +1379,7 @@ def sweep_and_save_runs(
     token_counts, sorted_noun_tokens, sorted_verb_tokens,
     word_primary_tag=None,
     out_dir="sweep_runs",
-    max_cum_prop_threshold=0.239,
+    max_cum_prop_threshold=0.45,
     target_prob_cutoff=0.0005,
     window_size=2, pattern_type=1,
     require_tag_match=False,
@@ -1574,7 +1583,7 @@ def run_mode_comparison(
     token_counts, sorted_noun_tokens, sorted_verb_tokens,
     word_primary_tag=None,
     out_dir="sweep_runs",
-    max_cum_prop_threshold=0.239,
+    max_cum_prop_threshold=0.45,
     target_prob_cutoff=0.0005,
     window_size=2,
     pattern_types=(1, 2, 3),
@@ -2368,20 +2377,27 @@ def build_arg_parser():
              "require_tag_match_false; ignored for all_tagged_nouns_verbs.",
     )
     parser.add_argument(
-        "--max-cum-prop-threshold", type=float, default=0.239,
+        "--max-cum-prop-threshold", type=float, default=0.45,
         help="Cap on the noun seed-list size tested, expressed as cumulative "
-             "proportion of noun tokens (e.g. 0.239 = include "
+             "proportion of noun tokens (e.g. 0.45 = include "
              "highest-frequency nouns up to the point where they account for "
-             "23.9%% of noun tokens, then stop - or the full Include==1 noun "
+             "45%% of noun tokens, then stop - or the full Include==1 noun "
              "list if it's smaller). The seed-set sweep is a MATCHED "
              "SEQUENCE, NOT a cross product: for each noun count 1..N below "
              "this cap, it's paired with whichever verb count(s) cover the "
              "matching share of verb tokens (see compute_seed_steps) - e.g. "
-             "N=36 gives 45 total (num_nouns, num_verbs) pairings with the "
-             "current seed files, not 36*33=1188. Default 0.239 (chosen so "
-             "verbs - only 33 curated words, covering 23.9%% of verb tokens "
-             "at most - are always fully matched, while nouns are capped to "
-             "a comparable ~36-word list with the current seed files).",
+             "N=139 gives 139 total (num_nouns, num_verbs) pairings with the "
+             "current seed files, not 139*33=4587. Default 0.45 (chosen so "
+             "verbs - only 33 curated words, covering 44.7%% of verb tokens "
+             "at most with the CURRENT seed files - are always fully "
+             "matched, while nouns are capped to a comparable ~139-word "
+             "list. This 44.7%% figure depends entirely on "
+             "verb_selection.xlsx's Include column, not on the corpus "
+             "itself - re-derive it (see compute_seed_steps's docstring) "
+             "and adjust this default if the verb seed list changes; an "
+             "earlier version of this default (0.239) was based on a "
+             "miscalculated 23.9%% figure and did not actually cover the "
+             "full verb list.",
     )
     parser.add_argument(
         "--num-sweep-steps", type=int, default=None,

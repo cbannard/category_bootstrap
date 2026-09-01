@@ -60,7 +60,13 @@ with open(output_filename, 'w') as fi:
         for line in lines:
             i = i+1
             line = line.rstrip()
-            line = re.sub("gon_go_VERB na_to_([A-Z]+)","gonna_gonna_VERB",line)
+            # "gon"'s lemma is always "go" (and "na"'s always "to"), but the
+            # tagger doesn't always tag "gon" itself as VERB - it's
+            # mistagged PROPN ~5% of the time (plus rarer X/AUX/INTJ), which
+            # a hardcoded "gon_go_VERB" would miss and leave split as
+            # "gon na" instead of merging. Wildcard both tags (only the
+            # lemmas need to match) so every occurrence merges regardless.
+            line = re.sub("gon_go_[A-Z]+ na_to_[A-Z]+","gonna_gonna_VERB",line)
             line = re.sub("got_got_VERB ta_to_([A-Z]+)","gotta_gotta_VERB",line)
             for m in _propn_noun_pat.finditer(line):
                 _lemma, _tag = m.group(2).lower(), m.group(3)
@@ -87,8 +93,31 @@ with open(output_filename, 'w') as fi:
             line = re.sub(r"([^ \_]+)_(be|do|have)_(VERB|AUX)", r"\1_\2_AUX", line)
             line = re.sub("'ll_([^ \\_]+)'ll_[A-Z]+","_\\1_NOUN 'll_will_VERB",line)
             line = re.sub("([a-z]+)@l_([^ ]+)","\\1@l_\\1@l_NOUN",line)
-            line = re.sub("([^ \\_]+)_([^ \\_]+)_NOUN 's\\_'s_PART","\\1's_\\1_NOUN",line)
-            line = re.sub("([^ \\_]+)_([^ \\_]+)_PRON 's\\_'s_PART","\\1's_\\1_PRON",line)
+            # Genuine possessive "'s" (lemma "'s", tag PART - as opposed to
+            # the far more common "'s" = "is"/"has"/"us" contraction, lemma
+            # "be"/"us", left untouched here) used to get FUSED onto the
+            # preceding word (e.g. "mummy_mummy_NOUN 's_'s_PART" ->
+            # "mummy's_mummy_NOUN"). That fused surface form never matches
+            # the plain noun seed list and never qualifies for NOUN
+            # abstraction, so it always showed up as unrecognized literal
+            # noise in any pattern where it was a context word (most
+            # visible with --no-abstract-context, but not limited to it).
+            # Drop the possessive marker instead, leaving the preceding
+            # token exactly as it already was - the possessive relation
+            # itself isn't represented in the pattern at all, but the word
+            # it attached to stays clean and matches its seed list normally.
+            #
+            # Originally only handled NOUN/PRON specifically. Checking the
+            # full corpus for every tag a genuine possessive actually
+            # follows turned up NOUN (by far the most common - PROPN cases
+            # are already NOUN by this point in the pipeline, since the
+            # PROPN->NOUN retag above runs before this), PRON, ADV, NUM,
+            # ADJ, SCONJ, and X (a long tail, ~30 occurrences total across
+            # the last five). Matched generically on "any tag" (rather than
+            # enumerating each one) so any other rare combination the
+            # tagger produces is covered automatically rather than needing
+            # another one-off fix later.
+            line = re.sub(r"([^ \_]+)_([^ \_]+)_([A-Z]+) 's\_'s_PART",r"\1_\2_\3",line)
             line = re.sub("ca_ca_VERB","ca_can_VERB",line)
             line = re.sub("wo_wo_VERB","wo_will_VERB",line)
             line = re.sub("sha_sha_VERB","sha_shall_VERB",line)

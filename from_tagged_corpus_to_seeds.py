@@ -102,10 +102,22 @@ with open(output_filename, 'w') as fi:
             # abstraction, so it always showed up as unrecognized literal
             # noise in any pattern where it was a context word (most
             # visible with --no-abstract-context, but not limited to it).
-            # Drop the possessive marker instead, leaving the preceding
-            # token exactly as it already was - the possessive relation
-            # itself isn't represented in the pattern at all, but the word
-            # it attached to stays clean and matches its seed list normally.
+            #
+            # Fix: leave the preceding token exactly as it already was (so
+            # it stays clean and matches its seed list normally), and
+            # retag the possessive marker itself as POSS (surface/lemma
+            # stay "'s", only the tag changes from the tagger's generic
+            # PART) instead of fusing it onto the noun. NOTE: because the
+            # surface form "'s" contains a letter, category_bootstrap.py's
+            # pattern-building code (_is_word_token, which decides this
+            # purely from the SURFACE FORM, not this tag) will NOT treat it
+            # as punctuation - it's a real word context token, so it shows
+            # up literally as "'s" in learned patterns (not normalized away,
+            # and not abstracted, since "'s" isn't on any seed list) rather
+            # than vanishing or being collapsed to "PUNCT". The POSS tag
+            # itself only affects the postprocessed corpus's own tag column
+            # (used by all_tagged_nouns_verbs mode, confusion_words/
+            # item-<pos> breakdowns, etc.), not the pattern text.
             #
             # Originally only handled NOUN/PRON specifically. Checking the
             # full corpus for every tag a genuine possessive actually
@@ -117,7 +129,7 @@ with open(output_filename, 'w') as fi:
             # enumerating each one) so any other rare combination the
             # tagger produces is covered automatically rather than needing
             # another one-off fix later.
-            line = re.sub(r"([^ \_]+)_([^ \_]+)_([A-Z]+) 's\_'s_PART",r"\1_\2_\3",line)
+            line = re.sub(r"([^ \_]+)_([^ \_]+)_([A-Z]+) 's\_'s_PART",r"\1_\2_\3 's_'s_POSS",line)
             line = re.sub("ca_ca_VERB","ca_can_VERB",line)
             line = re.sub("wo_wo_VERB","wo_will_VERB",line)
             line = re.sub("sha_sha_VERB","sha_shall_VERB",line)

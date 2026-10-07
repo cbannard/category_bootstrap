@@ -134,6 +134,13 @@ with open(output_filename, 'w') as fi:
             line = re.sub("wo_wo_VERB","wo_will_VERB",line)
             line = re.sub("sha_sha_VERB","sha_shall_VERB",line)
             line = re.sub(",_,_PUNCT ","",line)
+            # Also drop utterance terminators (".", "?", "!" and runs of them
+            # like "!?" or "..") - any PUNCT-tagged token made up only of these
+            # characters, wherever it occurs in the line. Children hear
+            # intonation, not punctuation, and the "}" sentence-boundary marker
+            # already encodes utterance-final position, so keeping them only
+            # added a redundant "PUNCT" context slot before every "}".
+            line = re.sub(r"(?:^| )[.?!]+_[.?!]+_PUNCT(?= |$)", "", line).strip()
             # We extracted a list of conjoined elements that are tagged as NOUN.
             # The following items were judged not to be NOUNs and so are retagged.
             line = re.sub("night_night_NOUN","night_night_X",line)
@@ -192,6 +199,8 @@ with open(output_filename, 'w') as fi:
             line = re.sub("_logistic_NOUN","_logistics_NOUN",line)
             line = re.sub("_tiddlywink_NOUN","_tiddlywinks_NOUN",line)
 
+            if not line:
+                continue  # nothing left after punctuation removal
             fi.write(line + "\n")
 
 

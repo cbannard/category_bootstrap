@@ -1049,23 +1049,26 @@ def compute_seed_steps(noun_seeds_df, verb_seeds_df,
     Include==1 noun list, if smaller).
 
     The matching walks the noun and verb cumulative-proportion staircases
-    together. Each noun count n is paired with every verb count v (0..the
+    together. Each noun count n is paired with every verb count v (1..the
     full verb list) whose OWN cumulative-proportion "breakpoint" falls
     strictly after noun count (n-1)'s cumulative proportion and up to and
     including noun count n's - i.e. whichever verb breakpoints appear while
-    the noun staircase is sitting on step n get attached to step n. v=0 (no
-    verbs at all) counts as a breakpoint at proportion 0, so noun counts
-    whose own proportion is still below the smallest real verb count's
-    proportion get paired with num_verbs=0 rather than being skipped or
-    forced onto verb count 1.
+    the noun staircase is sitting on step n get attached to step n.
+
+    Every pairing has at least ONE verb (and, since noun counts start at 1,
+    at least one noun): noun counts whose own proportion is still below the
+    most frequent verb's proportion are paired with num_verbs=1 rather than
+    num_verbs=0. (Previously v=0 was allowed, so the first several steps had
+    nouns but no verb seeds at all.)
 
     If a noun step's window happens to contain NO verb breakpoint at all
     (possible where verbs are coarser than nouns in some stretch), that noun
     count is still paired with the single best-matching verb count (the
     largest verb count whose own cumulative proportion doesn't exceed this
-    noun count's), so every noun count in range gets at least one pairing.
+    noun count's, floored at 1), so every noun count in range gets at least
+    one pairing.
 
-    This guarantees every noun count 1..N and every verb count 0..M appears
+    This guarantees every noun count 1..N and every verb count 1..M appears
     at least once across the returned sequence (N/M being however many of
     each max_cum_prop_threshold allows) - unlike a "closest single verb
     count per noun count" scheme, which can skip some verb counts entirely
@@ -1153,11 +1156,12 @@ def compute_seed_steps(noun_seeds_df, verb_seeds_df,
     for n in range(1, n_max + 1):
         p = n_cum[n - 1]
         matched = [
-            v for v in range(0, total_verb + 1)
-            if prev_noun_p < (v_cum[v - 1] if v > 0 else 0.0) <= p
+            v for v in range(1, total_verb + 1)
+            if prev_noun_p < v_cum[v - 1] <= p
         ]
         if not matched:
-            matched = [_best_verb_match(p)]
+            # floor at 1 so no step is ever verb-less (see docstring)
+            matched = [max(1, _best_verb_match(p))] if total_verb > 0 else [0]
         steps.extend((n, v) for v in matched)
         prev_noun_p = p
 

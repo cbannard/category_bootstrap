@@ -1003,6 +1003,21 @@ METRIC_COLS = [
     "baseline_macro_precision", "baseline_macro_recall",
     "baseline_micro_precision", "baseline_micro_recall",
 ]
+# Per-class test-set counts behind NOUN/VERB precision and recall (see
+# evaluate): token counts TP/FP/FN/TN, and the number of distinct word types
+# in TP, FP and FN, predicted as the class (pred_types: the types precision
+# is computed over) and truly of the class (true_types: the types recall is
+# computed over). Type counts overlap across cells, so they aren't additive.
+# Like every METRIC_COLS column they're averaged (with a _std) on "mean"
+# rows - multiply a token mean by n_folds for whole-corpus token totals;
+# type counts can't be summed across folds that way.
+COUNT_COLS = [
+    f"{cls}_{k}"
+    for cls in ("NOUN", "VERB")
+    for k in ("TP", "FP", "FN", "TN",
+              "TP_types", "FP_types", "FN_types", "pred_types", "true_types")
+]
+METRIC_COLS = METRIC_COLS + COUNT_COLS
 STD_COLS = [f"{c}_std" for c in METRIC_COLS]
 
 # "fold": None for a run made with n_folds=1 (pre-cross-validation single
@@ -1049,23 +1064,26 @@ def compute_seed_steps(noun_seeds_df, verb_seeds_df,
     Include==1 noun list, if smaller).
 
     The matching walks the noun and verb cumulative-proportion staircases
-    together. Each noun count n is paired with every verb count v (0..the
+    together. Each noun count n is paired with every verb count v (1..the
     full verb list) whose OWN cumulative-proportion "breakpoint" falls
     strictly after noun count (n-1)'s cumulative proportion and up to and
     including noun count n's - i.e. whichever verb breakpoints appear while
-    the noun staircase is sitting on step n get attached to step n. v=0 (no
-    verbs at all) counts as a breakpoint at proportion 0, so noun counts
-    whose own proportion is still below the smallest real verb count's
-    proportion get paired with num_verbs=0 rather than being skipped or
-    forced onto verb count 1.
+    the noun staircase is sitting on step n get attached to step n.
+
+    Every pairing has at least ONE verb (and, since noun counts start at 1,
+    at least one noun): noun counts whose own proportion is still below the
+    most frequent verb's proportion are paired with num_verbs=1 rather than
+    num_verbs=0. (Previously v=0 was allowed, so the first several steps had
+    nouns but no verb seeds at all.)
 
     If a noun step's window happens to contain NO verb breakpoint at all
     (possible where verbs are coarser than nouns in some stretch), that noun
     count is still paired with the single best-matching verb count (the
     largest verb count whose own cumulative proportion doesn't exceed this
-    noun count's), so every noun count in range gets at least one pairing.
+    noun count's, floored at 1), so every noun count in range gets at least
+    one pairing.
 
-    This guarantees every noun count 1..N and every verb count 0..M appears
+    This guarantees every noun count 1..N and every verb count 1..M appears
     at least once across the returned sequence (N/M being however many of
     each max_cum_prop_threshold allows) - unlike a "closest single verb
     count per noun count" scheme, which can skip some verb counts entirely
@@ -1074,7 +1092,7 @@ def compute_seed_steps(noun_seeds_df, verb_seeds_df,
     (two or more verb breakpoints landing in the same noun step's window)
     rather than every noun mapping to exactly one verb - with the current
     seed files/default threshold every noun count happens to pair with
-    exactly one verb count, for 139 total pairings (139 noun counts), but
+    exactly one verb count, for 177 total pairings (177 noun counts), but
     that 1:1 shape is a property of the current data, not guaranteed - a
     different seed file/threshold can produce noun counts that pair with
     two or more verb counts.
@@ -1153,11 +1171,12 @@ def compute_seed_steps(noun_seeds_df, verb_seeds_df,
     for n in range(1, n_max + 1):
         p = n_cum[n - 1]
         matched = [
-            v for v in range(0, total_verb + 1)
-            if prev_noun_p < (v_cum[v - 1] if v > 0 else 0.0) <= p
+            v for v in range(1, total_verb + 1)
+            if prev_noun_p < v_cum[v - 1] <= p
         ]
         if not matched:
-            matched = [_best_verb_match(p)]
+            # floor at 1 so no step is ever verb-less (see docstring)
+            matched = [max(1, _best_verb_match(p))] if total_verb > 0 else [0]
         steps.extend((n, v) for v in matched)
         prev_noun_p = p
 
@@ -1250,6 +1269,7 @@ def evaluate_single_run(
         "baseline_micro_precision": float(baseline.get('micro_precision', 0.0)),
         "baseline_micro_recall": float(baseline.get('micro_recall', 0.0)),
     }
+    row.update(metrics.get('counts', {}))
 
     confusion_text = (
         f"mode={run_mode}, pattern_type={pattern_type}, "
@@ -1270,8 +1290,15 @@ def evaluate_kfold_and_aggregate(
     abstract_context=True,
     track_target_words=False,
     run_mode="run",
+    total_folds=None,
 ):
     """
+    total_folds: the cross-validation's total number of folds, when `folds`
+    holds only some of them (the --fold single-fold path, one SLURM task
+    per fold). Recorded as each row's n_folds; defaults to len(folds). No
+    mean row is written unless `folds` itself holds more than one fold - for
+    --fold runs the mean/std rows are computed later by --merge.
+
     Runs evaluate_single_run once per fold in `folds` (see
     load_corpus_and_split/make_kfold_sentence_splits) and aggregates the
     results. Returns (rows, confusion_texts, confusion_words_list,
@@ -1322,7 +1349,7 @@ def evaluate_kfold_and_aggregate(
     learned_patterns_list = []
     learned_patterns_words_list = []
 
-    n_folds = len(folds)
+    n_folds = total_folds or len(folds)
     for fold_info in folds:
         fold_label = fold_info["fold"]
         if fold_label is not None:
@@ -1357,7 +1384,7 @@ def evaluate_kfold_and_aggregate(
         learned_patterns_list.append((fold_label, fold_num_nouns, fold_num_verbs, learned_patterns))
         learned_patterns_words_list.append((fold_label, fold_num_nouns, fold_num_verbs, learned_patterns_words))
 
-    if n_folds > 1:
+    if len(folds) > 1:
         mean_row = dict(rows[0])
         mean_row["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
         mean_row["fold"] = "mean"
@@ -1619,8 +1646,8 @@ def run_mode_comparison(
 
     So with the default pattern_types=(1, 2, 3), this runs 3 * (1 + 2 * G)
     passes total, where G is the number of (num_nouns, num_verbs) pairings
-    from compute_seed_steps (e.g. G=45 with the current seed files/default
-    threshold). pattern_type is recorded in its own summary.csv column, in
+    from compute_seed_steps (e.g. G=177 with the pre-October-2026 seed
+    files/default threshold - re-check with --print-num-seed-steps). pattern_type is recorded in its own summary.csv column, in
     the confusion_matrices.txt entry header, and in the confusion-words CSV
     filename, so every row/entry is traceable to exactly which (pattern_type,
     mode, seed-set) combination produced it.
@@ -1938,6 +1965,33 @@ def strict_precision_recall(results, guess_probs=None, sorted_noun_tokens=None,
 
     per_class = pd.DataFrame(rows, columns=['label','TP','FP','FN','precision','recall','f1']).set_index('label')
 
+    # Token counts behind precision/recall, plus the number of DISTINCT word
+    # types (df['token'], the same word identity pattern_usage's *_types
+    # columns use) in each cell - see COUNT_COLS. A word can fall in more
+    # than one cell (e.g. "walk" a TP on one occurrence and an FN on
+    # another), so the type columns are not additive: pred_types (types
+    # predicted L at least once = types behind precision's denominator) can
+    # be less than TP_types + FP_types, and true_types (types truly L at
+    # least once = types behind recall's denominator) less than TP_types +
+    # FN_types.
+    counts = {}
+    n_tokens = len(df)
+    for cls in classes:
+        is_pred = df['pred_mapped'] == cls
+        is_true = df['true_mapped'] == cls
+        TP, FP, FN = (int(per_class.at[cls, k]) for k in ('TP', 'FP', 'FN'))
+        counts.update({
+            f"{cls}_TP": TP,
+            f"{cls}_FP": FP,
+            f"{cls}_FN": FN,
+            f"{cls}_TN": n_tokens - TP - FP - FN,
+            f"{cls}_TP_types": int(df.loc[is_pred & is_true, 'token'].nunique()),
+            f"{cls}_FP_types": int(df.loc[is_pred & ~is_true, 'token'].nunique()),
+            f"{cls}_FN_types": int(df.loc[~is_pred & is_true, 'token'].nunique()),
+            f"{cls}_pred_types": int(df.loc[is_pred, 'token'].nunique()),
+            f"{cls}_true_types": int(df.loc[is_true, 'token'].nunique()),
+        })
+
     TP_sum = per_class['TP'].sum()
     FP_sum = per_class['FP'].sum()
     FN_sum = per_class['FN'].sum()
@@ -1992,6 +2046,7 @@ def strict_precision_recall(results, guess_probs=None, sorted_noun_tokens=None,
     print(detailed_confusion)
     return {
         'per_class': per_class,
+        'counts': counts,
         'micro': {'precision': micro_p, 'recall': micro_r, 'f1': micro_f},
         'macro': {'precision': macro_p, 'recall': macro_r, 'f1': macro_f},
         'confusion': detailed_confusion,
@@ -2002,7 +2057,7 @@ def strict_precision_recall(results, guess_probs=None, sorted_noun_tokens=None,
 
 ### RUNTIME CODE STARTS HERE ###
 
-def make_kfold_sentence_splits(n_sentences, n_folds, split_seed):
+def make_kfold_sentence_splits(n_sentences, n_folds, split_seed, only_fold=None):
     """
     Partition range(n_sentences) into n_folds folds of nearly-equal size,
     shuffled deterministically by split_seed, and return a list of
@@ -2034,8 +2089,13 @@ def make_kfold_sentence_splits(n_sentences, n_folds, split_seed):
         chunks.append(order[start:start + size])
         start += size
 
+    # only_fold: build just that one fold's (train, test) pair - the
+    # shuffle/chunking above is identical either way, so fold k is exactly
+    # the same split whether it's built alone (one SLURM task per fold, see
+    # --fold) or as part of the full list. Avoids materialising n_folds
+    # near-full-corpus training sets when only one is needed.
     splits = []
-    for fold in range(n_folds):
+    for fold in (range(n_folds) if only_fold is None else [only_fold]):
         test_idx_set = set(chunks[fold])
         train_idx_set = set().union(*(chunks[j] for j in range(n_folds) if j != fold))
         splits.append((train_idx_set, test_idx_set))
@@ -2044,7 +2104,7 @@ def make_kfold_sentence_splits(n_sentences, n_folds, split_seed):
 
 def load_corpus_and_split(corpus_file, split_seed=42, test_fraction=0.2,
                            corpus_size=None, subsample_scope="train_only",
-                           n_folds=5):
+                           n_folds=5, only_fold=None):
     """
     Reads the WORD_LEMMA_TAG corpus file, builds the flat token/tag lists
     (lemma-lowercased, sentence-bounded by "{"/"}"), then splits it by
@@ -2101,7 +2161,9 @@ def load_corpus_and_split(corpus_file, split_seed=42, test_fraction=0.2,
     used to be returned directly - see below). When n_folds==1, folds is a
     single-element list with 'fold'=None (not under cross-validation - keeps
     single-split callers/output filenames free of any fold labeling). When
-    n_folds>=2, folds has n_folds elements with 'fold'=0..n_folds-1.
+    n_folds>=2, folds has n_folds elements with 'fold'=0..n_folds-1 - or,
+    if only_fold is given, just the one element for that fold (same split
+    it would have had in the full list).
 
     token_counts, sorted_noun_tokens, sorted_verb_tokens, word_primary_tag
     are computed over the WHOLE corpus (see below) and so are shared/
@@ -2279,9 +2341,12 @@ def load_corpus_and_split(corpus_file, split_seed=42, test_fraction=0.2,
         # i.e. positions WITHIN sentence_pool, not raw corpus sentence
         # indices - map each fold's local indices back through
         # sentence_pool to get real sentence_bounds indices.
-        fold_splits = make_kfold_sentence_splits(len(sentence_pool), n_folds, split_seed)
+        if only_fold is not None and not (0 <= only_fold < n_folds):
+            raise ValueError(f"--fold {only_fold} out of range for --n-folds {n_folds} (valid: 0..{n_folds - 1})")
+        fold_splits = make_kfold_sentence_splits(len(sentence_pool), n_folds, split_seed, only_fold=only_fold)
+        fold_ids = range(n_folds) if only_fold is None else [only_fold]
         folds = []
-        for fold_i, (train_local, test_local) in enumerate(fold_splits):
+        for fold_i, (train_local, test_local) in zip(fold_ids, fold_splits):
             train_idx_set = {sentence_pool[j] for j in train_local}
             test_idx_set = {sentence_pool[j] for j in test_local}
             train, test, train_tags, test_tags, train_words, test_words = _extract(train_idx_set, test_idx_set)
@@ -2297,12 +2362,59 @@ def load_corpus_and_split(corpus_file, split_seed=42, test_fraction=0.2,
                 f"Corpus subsampled to corpus_size={corpus_size} sentence(s) "
                 f"(of {n_sentences} total) before {n_folds}-fold split."
             )
-        print(f"{n_folds}-fold cross-validation: {len(sentence_pool)} sentence(s) split into {n_folds} folds.")
+        print(f"{n_folds}-fold cross-validation: {len(sentence_pool)} sentence(s) split into {n_folds} folds"
+              + ("." if only_fold is None else f"; running fold {only_fold} only."))
 
     return (
         folds,
         token_counts, sorted_noun_tokens, sorted_verb_tokens, word_primary_tag,
     )
+
+
+def _add_fold_job_means(df):
+    """
+    For jobs run one fold per process (--fold, see run_cluster_slurm.sh
+    FOLD_JOBS=1), each summary part holds a single fold row and no "mean"
+    row. Add one "mean" row per job here - mean and std (np.std, as in
+    evaluate_kfold_and_aggregate) of every METRIC_COLS column across that
+    job's fold rows. A job = (mode, pattern_type, num_noun_seeds,
+    num_verb_seeds), except all_tagged_nouns_verbs, whose seed counts vary
+    by fold and which is grouped on (mode, pattern_type) alone. Jobs that
+    already have a "mean" row (whole cross-validation run in one process)
+    are left untouched. The mean row's n_folds is the number of fold rows
+    actually found; a warning is printed if that's fewer than expected.
+    """
+    fold_num = pd.to_numeric(df["fold"], errors="coerce")
+    is_mean = df["fold"].astype(str) == "mean"
+    df = df.copy()
+    df["_job"] = list(zip(
+        df["mode"], df["pattern_type"],
+        df["num_noun_seeds"].where(df["mode"] != "all_tagged_nouns_verbs", -1),
+        df["num_verb_seeds"].where(df["mode"] != "all_tagged_nouns_verbs", -1),
+    ))
+    have_mean = set(df.loc[is_mean, "_job"])
+    new_rows = []
+    for job, g in df[fold_num.notna()].groupby("_job", sort=False):
+        if job in have_mean or len(g) == 0:
+            continue
+        g = g.assign(_f=pd.to_numeric(g["fold"])).sort_values("_f")
+        expected = int(g["n_folds"].max())
+        if len(g) < expected:
+            print(f"WARNING: {job[0]} p{job[1]} n{job[2]} v{job[3]}: only {len(g)} of "
+                  f"{expected} folds found - mean row uses those {len(g)}.")
+        mean_row = g.iloc[0].to_dict()
+        mean_row["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        mean_row["fold"] = "mean"
+        mean_row["n_folds"] = len(g)
+        for c in METRIC_COLS:
+            vals = pd.to_numeric(g[c], errors="coerce").to_numpy(dtype=float)
+            mean_row[c] = float(np.nanmean(vals))
+            mean_row[f"{c}_std"] = float(np.nanstd(vals))
+        new_rows.append(mean_row)
+    if new_rows:
+        df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+        print(f"Added {len(new_rows)} across-fold mean row(s) for per-fold (--fold) jobs.")
+    return df[SUMMARY_COLS]
 
 
 def merge_parts(out_dir):
@@ -2321,6 +2433,7 @@ def merge_parts(out_dir):
     if part_files:
         parts_df = pd.concat([pd.read_csv(p) for p in part_files], ignore_index=True)
         parts_df = parts_df[SUMMARY_COLS]
+        parts_df = _add_fold_job_means(parts_df)
         if not os.path.exists(summary_path):
             parts_df.to_csv(summary_path, index=False)
         else:
@@ -2386,11 +2499,12 @@ def build_arg_parser():
              "SEQUENCE, NOT a cross product: for each noun count 1..N below "
              "this cap, it's paired with whichever verb count(s) cover the "
              "matching share of verb tokens (see compute_seed_steps) - e.g. "
-             "N=139 gives 139 total (num_nouns, num_verbs) pairings with the "
-             "current seed files, not 139*33=4587. Default 0.45 (chosen so "
+             "N=177 gives 177 total (num_nouns, num_verbs) pairings with the "
+             "pre-October-2026 seed files, not 177*33=5841. Every pairing "
+             "has at least 1 verb (and at least 1 noun). Default 0.45 (chosen so "
              "verbs - only 33 curated words, covering 44.7%% of verb tokens "
              "at most with the CURRENT seed files - are always fully "
-             "matched, while nouns are capped to a comparable ~139-word "
+             "matched, while nouns are capped to a comparable ~177-word "
              "list. This 44.7%% figure depends entirely on "
              "verb_selection.xlsx's Include column, not on the corpus "
              "itself - re-derive it (see compute_seed_steps's docstring) "
@@ -2456,6 +2570,14 @@ def build_arg_parser():
              "relevant when --n-folds 1).",
     )
     parser.add_argument(
+        "--fold", type=int, default=None,
+        help="Run ONLY this fold (0-indexed) of the --n-folds cross-validation, "
+             "instead of every fold in turn. Single-job mode only (needs --mode). "
+             "The split is identical to the one the full run would use for that "
+             "fold. Used by run_cluster_slurm.sh FOLD_JOBS=1 to run each fold as "
+             "its own SLURM task; --merge then adds the across-fold mean rows.",
+    )
+    parser.add_argument(
         "--test-fraction", type=float, default=0.2,
         help="Fraction of sentences held out as the test set. Only used when "
              "--n-folds 1 (ignored under cross-validation, where each fold's test "
@@ -2514,11 +2636,17 @@ def main():
         print(len(steps))
         return
 
+    if args.fold is not None:
+        if args.mode is None:
+            raise SystemExit("--fold needs --mode (single-job mode)")
+        if args.n_folds < 2:
+            raise SystemExit("--fold needs --n-folds of at least 2")
+
     (folds, token_counts,
      sorted_noun_tokens, sorted_verb_tokens, word_primary_tag) = load_corpus_and_split(
         args.corpus_file, split_seed=args.split_seed, test_fraction=args.test_fraction,
         corpus_size=args.corpus_size, subsample_scope=args.subsample_scope,
-        n_folds=args.n_folds,
+        n_folds=args.n_folds, only_fold=args.fold,
     )
 
     noun_seeds = pd.read_excel(args.noun_seeds_file)
@@ -2617,13 +2745,17 @@ def main():
         all_tagged_nouns_verbs=all_tagged, abstract_context=args.abstract_context,
         track_target_words=args.emit_target_words,
         run_mode=args.mode,
+        total_folds=args.n_folds if args.fold is not None else None,
     )
 
     run_mode_safe = re.sub(r"[^A-Za-z0-9_-]+", "_", args.mode)
     job_id = f"{run_mode_safe}_p{args.pattern_type}_{step_label}_n{num_nouns}_v{num_verbs}"
 
-    pd.DataFrame(rows)[SUMMARY_COLS].to_csv(os.path.join(parts_dir, f"{job_id}.csv"), index=False)
-    with open(os.path.join(conf_parts_dir, f"{job_id}.txt"), "w", encoding="utf-8") as f:
+    # per-fold tasks (--fold) each write their own summary/confusion part;
+    # per-fold artifact files below already carry a _fold<N> suffix.
+    part_id = job_id if args.fold is None else f"{job_id}_fold{args.fold}"
+    pd.DataFrame(rows)[SUMMARY_COLS].to_csv(os.path.join(parts_dir, f"{part_id}.csv"), index=False)
+    with open(os.path.join(conf_parts_dir, f"{part_id}.txt"), "w", encoding="utf-8") as f:
         for _fold_label, confusion_text in confusion_texts:
             f.write(confusion_text)
 
@@ -2658,7 +2790,7 @@ def main():
             learned_patterns_words.to_excel(learned_patterns_words_xlsx_path, index=False)
             print(f"Learned patterns/target-words (literal + category) written to {learned_patterns_words_xlsx_path}")
 
-    print(f"Single-run result written to {parts_dir}/{job_id}.csv and {conf_parts_dir}/{job_id}.txt")
+    print(f"Single-run result written to {parts_dir}/{part_id}.csv and {conf_parts_dir}/{part_id}.txt")
 
 
 if __name__ == "__main__":

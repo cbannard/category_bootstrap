@@ -1681,6 +1681,8 @@ def run_mode_comparison(
             run_mode="require_tag_match_false", pattern_type=pattern_type, **common,
         )
 
+    if summary_path:
+        write_summary_means(summary_path)
     return summary_path, confusion_path
 
 def baseline_random_scores(true_mapped, guess_probs=None):
@@ -2417,6 +2419,27 @@ def _add_fold_job_means(df):
     return df[SUMMARY_COLS]
 
 
+def write_summary_means(summary_path):
+    """
+    Writes summary_means.csv next to summary_path: one row per run, i.e. the
+    "mean" rows (fold means, with _std columns, of every METRIC_COLS column,
+    including the COUNT_COLS token/type counts), plus the single row of any
+    run made with --n-folds 1, which has no separate mean row. Individual
+    fold rows are left out. Rebuilt from the whole of summary.csv each time,
+    so it stays in step if summary.csv is appended to by a later merge.
+    """
+    if not os.path.exists(summary_path):
+        return None
+    df = pd.read_csv(summary_path, dtype={"fold": str}, low_memory=False)
+    fold = df["fold"].fillna("")
+    single = pd.to_numeric(df["n_folds"], errors="coerce").fillna(1) <= 1
+    means = df[(fold == "mean") | ((fold == "") & single)]
+    means_path = os.path.join(os.path.dirname(summary_path), "summary_means.csv")
+    means.to_csv(means_path, index=False)
+    print(f"Wrote {len(means)} per-run row(s) (fold means) to {means_path}")
+    return means_path
+
+
 def merge_parts(out_dir):
     """
     Combines the per-job outputs written by single-job CLI runs (--mode ...)
@@ -2447,6 +2470,7 @@ def merge_parts(out_dir):
                 )
             parts_df.to_csv(summary_path, mode="a", header=False, index=False)
         print(f"Merged {len(part_files)} summary part(s) ({len(parts_df)} row(s)) into {summary_path}")
+        write_summary_means(summary_path)
     else:
         print(f"No summary parts found in {parts_dir}")
 

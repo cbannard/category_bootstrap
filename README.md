@@ -190,16 +190,16 @@ PARTITION=himem MEM_PER_TASK=32G english/run_cluster_slurm.sh sweep_out 0.45
 
 This script was written and syntax-checked without access to a real SLURM scheduler, so it's worth a dry run (e.g. with a small `--array` throttle, or checking `jobs.txt`/`--print-num-seed-steps` first) before trusting it for a long sweep.
 
-## Notebooks
+## Notebooks (old code, not needed)
 
-The Jupyter notebooks (`ChildesDataPrep_Eng.ipynb`, `ChildesDataPrep_JP.ipynb`, `postTaggingProcessing.ipynb`, `GlobalWordnet.ipynb`) are not part of the pipeline and are kept on the [`notebooks`](https://github.com/cbannard/category_bootstrap/tree/notebooks) branch:
+The Jupyter notebooks are **old code kept only for reference**. Nothing in the pipeline uses them, and you shouldn't need them to prepare the data or run anything: everything they did is now done by the scripts above. They aren't maintained and may not match the current file formats. They are kept on the [`notebooks`](https://github.com/cbannard/category_bootstrap/tree/notebooks) branch rather than on `main`:
 
-- `ChildesDataPrep_Eng.ipynb` — original English corpus preparation, now replaced by `childes_data_prep_eng.py` (Pipeline step 0).
-- `ChildesDataPrep_JP.ipynb` — corpus preparation for the Japanese CHILDES data.
-- `postTaggingProcessing.ipynb` — early exploratory version of the tag cleanup now done in `from_tagged_corpus_to_seeds.py`.
-- `GlobalWordnet.ipynb` — WordNet exploration used in seed selection.
+- `ChildesDataPrep_Eng.ipynb` — original English corpus preparation, replaced by `english/childes_data_prep_eng.py` (Pipeline step 0).
+- `ChildesDataPrep_JP.ipynb` — earlier corpus preparation for the Japanese CHILDES data.
+- `postTaggingProcessing.ipynb` — early exploratory version of the tag cleanup now done in `english/from_tagged_corpus_to_seeds.py`.
+- `GlobalWordnet.ipynb` — early WordNet exploration for seed selection, now done in `english/from_tagged_corpus_to_seeds.py`.
 
-To get them: `git checkout notebooks -- '*.ipynb'` (or switch to the branch).
+If you do want to look at them: `git checkout notebooks -- '*.ipynb'` (or switch to the branch).
 
 ## Requirements
 

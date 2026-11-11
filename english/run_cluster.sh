@@ -120,7 +120,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_SCRIPT="$SCRIPT_DIR/category_bootstrap.py"
+PYTHON_SCRIPT="$SCRIPT_DIR/../category_bootstrap.py"
+# English corpus and seed files, all kept alongside this script. Given
+# explicitly because category_bootstrap.py has no language-specific defaults;
+# anything in EXTRA_ARGS comes later on the command line, so it can still
+# override these.
+CORPUS_FILE="$SCRIPT_DIR/manchester_input_tagged_trf_word_and_lemma_postprocessed.txt"
+NOUN_SEEDS_FILE="$SCRIPT_DIR/noun_selection.xlsx"
+VERB_SEEDS_FILE="$SCRIPT_DIR/verb_selection.xlsx"
 SEEDS_SCRIPT="$SCRIPT_DIR/from_tagged_corpus_to_seeds.py"
 
 OUT_DIR="${1:-sweep_out}"
@@ -173,14 +180,14 @@ trap 'rm -f "$JOBS_FILE"' EXIT
 # queried rather than assumed. Independent of pattern_type/mode
 # (require_tag_match_true and _false sweep the identical sequence), so this
 # only needs to run once.
-NUM_STEPS="$(python3 "$PYTHON_SCRIPT" --print-num-seed-steps --max-cum-prop-threshold "$MAX_CUM_PROP_THRESHOLD" $EXTRA_ARGS)"
+NUM_STEPS="$(python3 "$PYTHON_SCRIPT" --print-num-seed-steps --noun-seeds-file "$NOUN_SEEDS_FILE" --verb-seeds-file "$VERB_SEEDS_FILE" --max-cum-prop-threshold "$MAX_CUM_PROP_THRESHOLD" $EXTRA_ARGS)"
 echo "Seed-set sweep size: $NUM_STEPS pairings (--max-cum-prop-threshold $MAX_CUM_PROP_THRESHOLD, plus any --noun-seeds-file/--verb-seeds-file/--num-sweep-steps overrides in EXTRA_ARGS)."
 
 for pattern_type in 1 2 3; do
-    echo "python3 \"$PYTHON_SCRIPT\" --mode all_tagged_nouns_verbs --pattern-type $pattern_type --out-dir \"$OUT_DIR\" $CORPUS_SIZE_ARGS $EXTRA_ARGS" >> "$JOBS_FILE"
+    echo "python3 \"$PYTHON_SCRIPT\" --mode all_tagged_nouns_verbs --pattern-type $pattern_type --corpus-file \"$CORPUS_FILE\" --noun-seeds-file \"$NOUN_SEEDS_FILE\" --verb-seeds-file \"$VERB_SEEDS_FILE\" --out-dir \"$OUT_DIR\" $CORPUS_SIZE_ARGS $EXTRA_ARGS" >> "$JOBS_FILE"
     for mode in require_tag_match_true require_tag_match_false; do
         for ((step = 0; step < NUM_STEPS; step++)); do
-            echo "python3 \"$PYTHON_SCRIPT\" --mode $mode --pattern-type $pattern_type --seed-step $step --out-dir \"$OUT_DIR\" --max-cum-prop-threshold $MAX_CUM_PROP_THRESHOLD $CORPUS_SIZE_ARGS $EXTRA_ARGS" >> "$JOBS_FILE"
+            echo "python3 \"$PYTHON_SCRIPT\" --mode $mode --pattern-type $pattern_type --seed-step $step --corpus-file \"$CORPUS_FILE\" --noun-seeds-file \"$NOUN_SEEDS_FILE\" --verb-seeds-file \"$VERB_SEEDS_FILE\" --out-dir \"$OUT_DIR\" --max-cum-prop-threshold $MAX_CUM_PROP_THRESHOLD $CORPUS_SIZE_ARGS $EXTRA_ARGS" >> "$JOBS_FILE"
         done
     done
 done

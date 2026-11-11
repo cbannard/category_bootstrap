@@ -2,7 +2,16 @@
 
 Code for bootstrapping words into grammatical categories (NOUN/VERB) from a tagged child-language corpus, based on Brusini et al. (2021). It extracts context patterns around seed nouns/verbs, uses those patterns to categorize other words in the corpus, and scores the result against the corpus's own tags.
 
+## Repository layout
+
+- `category_bootstrap.py` (top level) — the bootstrapping/evaluation pipeline itself. It is language-independent: it takes any corpus in `WORD_LEMMA_TAG` format with Universal Dependencies-style tags (`NOUN`, `VERB`, ...) plus noun and verb seed lists, all given on the command line (`--corpus-file`, `--noun-seeds-file`, `--verb-seeds-file`; there are no defaults).
+- `english/` — everything specific to the English (Manchester CHILDES) run: corpus preparation, tag cleanup and seed selection scripts, the seed lists and curated word lists, and the cluster run scripts, which point `category_bootstrap.py` at the English files. Other languages would get their own sibling directory.
+
+The English scripts read and write their data files inside `english/`, so the corpus files below (which aren't in git) need to live there too, and `childes_data_prep_eng.py`, `from_tagged_corpus_to_seeds.py` and `detect_fake_singular_lemmas.py` should be run from inside `english/`.
+
 ## Data
+
+All of these live in `english/`.
 
 - `manchester_input_tagged_trf_word_and_lemma.txt` — raw tagged Manchester corpus, one utterance per line, tokens in `WORD_LEMMA_TAG` format.
 - `manchester_input_tagged_trf_word_and_lemma_postprocessed.txt` — cleaned-up version produced by `from_tagged_corpus_to_seeds.py` (tag/lemma fixups, filler-word normalization, punctuation stripped). This is the file `category_bootstrap.py` actually reads. `be`, `do`, and `have` are retagged away from `VERB` entirely here (blanket exclusion, covering both auxiliary and lexical/main-verb uses), so they never count as verbs anywhere downstream, including `all_tagged_nouns_verbs` mode (which reads tags directly).
@@ -11,7 +20,7 @@ Code for bootstrapping words into grammatical categories (NOUN/VERB) from a tagg
 
 ## Pipeline
 
-### 0. `childes_data_prep_eng.py` — corpus preparation and tagging
+### 0. `english/childes_data_prep_eng.py` — corpus preparation and tagging
 
 Builds a POS-tagged English corpus from the raw Manchester CHILDES transcripts (converted from the former `ChildesDataPrep_Eng.ipynb`). It:
 
@@ -20,6 +29,7 @@ Builds a POS-tagged English corpus from the raw Manchester CHILDES transcripts (
 3. tags and lemmatizes each utterance with spaCy `en_core_web_trf` and writes one utterance per line as space-separated `word_lemma_POS` tokens, i.e. `manchester_input_tagged_trf_word_and_lemma.txt`, the input to step 1. `--no-lemma` writes the notebook's original `word_POS` format instead.
 
 ```
+cd english
 python3 childes_data_prep_eng.py --download                           # fetch the corpus, then clean and tag it
 python3 childes_data_prep_eng.py --corpus-dir Manchester/ --output manchester_input_tagged_trf_word_and_lemma.txt
 python3 childes_data_prep_eng.py --no-tag --report-odd-chars          # just check the cleanup for leftover markup
@@ -35,11 +45,12 @@ python3 childes_data_prep_eng.py --no-tag --report-odd-chars          # just che
 | `--no-tag` | off | skip the spaCy tagging step |
 | `--spacy-model` | `en_core_web_trf` | spaCy model to use (`python -m spacy download en_core_web_trf`) |
 
-### 1. `from_tagged_corpus_to_seeds.py`
+### 1. `english/from_tagged_corpus_to_seeds.py`
 
 Reads the raw corpus, applies tag/token cleanup rules, writes the postprocessed corpus file, then builds the noun and verb seed selection files (`noun_selection.xlsx`/`.csv`, `verb_selection.xlsx`/`.csv`). Run this first, and whenever the raw corpus or `verb_inclusion.xlsx` changes.
 
 ```
+cd english
 python3 from_tagged_corpus_to_seeds.py
 ```
 
@@ -50,6 +61,7 @@ Beyond the tag/token cleanup rules, this script also:
 - **Manual proper-noun blocklist.** `--exclude-nouns-file` takes a plain text file, one lemma per line (case-insensitive; blank lines and `#`-prefixed comments ignored), and forces `Include=0` for every lemma listed, on top of (never overriding back to `Include=1`) the automatic checks above. Use this for names the PROPN-ratio check misses - e.g. a name tagged `NOUN` more often than `PROPN` in this particular corpus, so it stays under the ratio threshold despite not being a real common noun. Recorded in its own `ManuallyExcluded` column so it's clear from the seed file which mechanism excluded a given lemma. Any listed lemma that doesn't match a current noun candidate is printed as unmatched (typo check) but otherwise ignored.
 
 ```
+cd english
 python3 from_tagged_corpus_to_seeds.py --proper-noun-ratio-threshold 0.99 --exclude-nouns-file extra_proper_nouns.txt
 ```
 
@@ -88,8 +100,8 @@ Useful flags (see `python3 category_bootstrap.py --help` for the full list):
 | `--no-abstract-context` | off (abstraction on) | disable noun/verb abstraction of CONTEXT words - see Context abstraction above |
 | `--emit-target-words` | off | also write a `learned_patterns_words_*.xlsx` with the target's literal surface word always kept (never collapsed to NOUN/VERB) alongside its NOUN/VERB/OTHER category - purely an extra reporting output, doesn't affect any evaluation metric |
 | `--out-dir` | `sweep_out` | output directory |
-| `--corpus-file` | `manchester_input_tagged_trf_word_and_lemma_postprocessed.txt` | corpus to read |
-| `--noun-seeds-file` / `--verb-seeds-file` | `noun_selection.xlsx` / `verb_selection.xlsx` | seed files |
+| `--corpus-file` | (required) | corpus to read, e.g. `english/manchester_input_tagged_trf_word_and_lemma_postprocessed.txt` |
+| `--noun-seeds-file` / `--verb-seeds-file` | (required) | seed files, e.g. `english/noun_selection.xlsx` / `english/verb_selection.xlsx` |
 | `--n-folds` | 5 | number of folds for k-fold cross-validation; `--n-folds 1` runs a single 80/20-style split instead - see Cross-validation above |
 | `--test-fraction` | 0.2 | fraction of sentences held out for testing (only used when `--n-folds 1`) |
 | `--split-seed` | 42 | RNG seed for the train/test split (keeps the split identical across independent processes) |
@@ -100,14 +112,17 @@ Useful flags (see `python3 category_bootstrap.py --help` for the full list):
 Example — run everything in one process:
 
 ```
-python3 category_bootstrap.py --out-dir sweep_out
+python3 category_bootstrap.py --out-dir sweep_out \
+    --corpus-file english/manchester_input_tagged_trf_word_and_lemma_postprocessed.txt \
+    --noun-seeds-file english/noun_selection.xlsx --verb-seeds-file english/verb_selection.xlsx
 ```
 
 Example — run a single job (as the cluster scripts do), then merge:
 
 ```
-python3 category_bootstrap.py --mode require_tag_match_true --pattern-type 2 --seed-step 3 --out-dir sweep_out
-python3 category_bootstrap.py --merge --out-dir sweep_out
+FILES="--corpus-file english/manchester_input_tagged_trf_word_and_lemma_postprocessed.txt --noun-seeds-file english/noun_selection.xlsx --verb-seeds-file english/verb_selection.xlsx"
+python3 category_bootstrap.py --mode require_tag_match_true --pattern-type 2 --seed-step 3 --out-dir sweep_out $FILES
+python3 category_bootstrap.py --merge --out-dir sweep_out    # --merge needs no input files
 ```
 
 ### Outputs
@@ -120,20 +135,22 @@ python3 category_bootstrap.py --merge --out-dir sweep_out
 
 ## Running the full comparison on a cluster
 
+The run scripts are in `english/` and pass the English corpus and seed files (from `english/`) to `category_bootstrap.py` themselves; they can be run from any directory, and `OUT_DIR` is relative to wherever you run them from.
+
 The full mode × pattern-type comparison (3 pattern types × (1 `all_tagged_nouns_verbs` + N `require_tag_match_true` + N `require_tag_match_false`) runs, where N is the number of `(num_nouns, num_verbs)` pairings from `compute_seed_steps` - a MATCHED SEQUENCE, not a cross product/grid, queried fresh each run via `--print-num-seed-steps` since it depends on the actual seed files - currently 139 pairings with the default `--max-cum-prop-threshold 0.45`, i.e. 3 × (1 + 139 + 139) = 837 jobs) can be dispatched as many independent single-job processes instead of running sequentially in one process. Each job also runs `--n-folds` (default 5) k-fold cross-validation internally, so expect roughly 5× the runtime and roughly 5× the per-job `learned_patterns_*`/`confusion_words_*`/`pattern_usage_*` files (one set per fold) compared to a single 80/20 split; pass `EXTRA_ARGS="--n-folds 1"` to reproduce the original single-split behavior instead.
 
 Both cluster scripts run a preflight step before dispatching any jobs: by default (`REGENERATE_SEEDS=1`, the default) they rerun `from_tagged_corpus_to_seeds.py` to regenerate the postprocessed corpus and `noun_selection.csv`/`verb_selection.csv`, then refresh `noun_selection.xlsx`/`verb_selection.xlsx` from those `.csv` files - so a sweep never silently runs against a stale postprocessed corpus or seed list (e.g. after editing `from_tagged_corpus_to_seeds.py`'s tag cleanup rules or `verb_inclusion.xlsx`'s `Include` judgments). The regeneration passes `--exclude-nouns-file extra_proper_nouns.txt`, so the manual proper-noun blocklist is always applied; point `EXCLUDE_NOUNS_FILE` at a different file to use another list, or set it to an empty string (`EXCLUDE_NOUNS_FILE=`) to regenerate without one. Set `REGENERATE_SEEDS=0` to skip this and dispatch against whatever's already on disk instead (useful if you've already regenerated things yourself, or want to avoid the network-dependent wordnet/`wn` lexicon download on every run). In `run_cluster_slurm.sh` this runs once on the submission host, before any `sbatch` call, since compute nodes may lack the network access the one-time wordnet/`wn` download needs.
 
 ```
-REGENERATE_SEEDS=0 ./run_cluster.sh sweep_out 0.45 8
+REGENERATE_SEEDS=0 english/run_cluster.sh sweep_out 0.45 8
 ```
 
-### `run_cluster.sh` — local / any-scheduler parallel dispatch
+### `english/run_cluster.sh` — local / any-scheduler parallel dispatch
 
 Runs all jobs via `xargs -P`, using as many workers as requested (default: all cores), then merges.
 
 ```
-./run_cluster.sh [OUT_DIR] [MAX_CUM_PROP_THRESHOLD] [JOBS] [CORPUS_SIZE]
+english/run_cluster.sh [OUT_DIR] [MAX_CUM_PROP_THRESHOLD] [JOBS] [CORPUS_SIZE]
 ```
 
 - `OUT_DIR` — default `sweep_out`
@@ -141,20 +158,20 @@ Runs all jobs via `xargs -P`, using as many workers as requested (default: all c
 - `JOBS` — default: number of cores (`nproc`), or 4 if unavailable
 - `CORPUS_SIZE` — optional; forwarded as `--corpus-size` to every job. Default: unset, i.e. full corpus.
 
-Extra `category_bootstrap.py` flags (`--corpus-file`, `--noun-seeds-file`, `--verb-seeds-file`, `--num-sweep-steps`, `--window-size`, `--n-folds`, `--test-fraction`, `--split-seed`, `--subsample-scope`) can be forwarded to every job via the `EXTRA_ARGS` environment variable:
+Extra `category_bootstrap.py` flags (`--corpus-file`, `--noun-seeds-file`, `--verb-seeds-file`, `--num-sweep-steps`, `--window-size`, `--n-folds`, `--test-fraction`, `--split-seed`, `--subsample-scope`) can be forwarded to every job via the `EXTRA_ARGS` environment variable (these come after the script's own `--corpus-file`/`--noun-seeds-file`/`--verb-seeds-file`, so they override them):
 
 ```
-EXTRA_ARGS="--window-size 3" ./run_cluster.sh sweep_out 0.45 8
-EXTRA_ARGS="--n-folds 1" ./run_cluster.sh sweep_out 0.45 8   # old single-split behavior
-EXTRA_ARGS="--subsample-scope whole_corpus" ./run_cluster.sh sweep_out 0.45 8 5000
+EXTRA_ARGS="--window-size 3" english/run_cluster.sh sweep_out 0.45 8
+EXTRA_ARGS="--n-folds 1" english/run_cluster.sh sweep_out 0.45 8   # old single-split behavior
+EXTRA_ARGS="--subsample-scope whole_corpus" english/run_cluster.sh sweep_out 0.45 8 5000
 ```
 
-### `run_cluster_slurm.sh` — SLURM job array
+### `english/run_cluster_slurm.sh` — SLURM job array
 
 Generates the same job list, then submits it as a SLURM array job (one array task per job) on the `serial` partition with a 1-day time limit, followed by a dependent merge job that only runs once the whole array has completed successfully.
 
 ```
-./run_cluster_slurm.sh [OUT_DIR] [MAX_CUM_PROP_THRESHOLD] [MAX_CONCURRENT_TASKS] [CORPUS_SIZE]
+english/run_cluster_slurm.sh [OUT_DIR] [MAX_CUM_PROP_THRESHOLD] [MAX_CONCURRENT_TASKS] [CORPUS_SIZE]
 ```
 
 - `OUT_DIR` — default `sweep_out`
@@ -167,7 +184,7 @@ Override the partition/time limit via the `PARTITION` / `TIME_LIMIT` environment
 Example — full sweep with full cross-validation on a `himem` partition requiring an explicit memory request:
 
 ```
-PARTITION=himem MEM_PER_TASK=32G ./run_cluster_slurm.sh sweep_out 0.45
+PARTITION=himem MEM_PER_TASK=32G english/run_cluster_slurm.sh sweep_out 0.45
 ```
 
 This script was written and syntax-checked without access to a real SLURM scheduler, so it's worth a dry run (e.g. with a small `--array` throttle, or checking `jobs.txt`/`--print-num-seed-steps` first) before trusting it for a long sweep.

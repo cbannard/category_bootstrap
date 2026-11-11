@@ -903,7 +903,7 @@ def compute_seed_tag_guess_probs(corpus, seeds, corpus_words=None, corpus_tags=N
     _is_word_token). Both required and must be the same length.
 
     corpus_tags: the corpus's own per-occurrence POS tags (spaCy-derived -
-    see childes_data_prep_eng.py), required.
+    see e.g. english/childes_data_prep_eng.py), required.
 
     require_tag_match mirrors the run's own noun/verb criterion (same flag
     passed to extract_context_patterns_fast/categorize_with_contexts_fast
@@ -2554,9 +2554,15 @@ def build_arg_parser():
              "evaluation metric. Default off (original behavior/file set).",
     )
     parser.add_argument("--out-dir", default="sweep_out")
-    parser.add_argument("--corpus-file", default="manchester_input_tagged_trf_word_and_lemma_postprocessed.txt")
-    parser.add_argument("--noun-seeds-file", default="noun_selection.xlsx")
-    parser.add_argument("--verb-seeds-file", default="verb_selection.xlsx")
+    parser.add_argument("--corpus-file", default=None,
+                        help="tagged corpus, one sentence per line of WORD_LEMMA_TAG tokens "
+                             "(required unless --merge)")
+    parser.add_argument("--noun-seeds-file", default=None,
+                        help="noun seed list (.xlsx with Word/Count/Include columns; "
+                             "required unless --merge)")
+    parser.add_argument("--verb-seeds-file", default=None,
+                        help="verb seed list (.xlsx with Word/Count/Include columns; "
+                             "required unless --merge)")
     parser.add_argument(
         "--n-folds", type=int, default=5,
         help="Number of folds for k-fold cross-validation (default: 5). Every "
@@ -2612,11 +2618,21 @@ def build_arg_parser():
 
 
 def main():
-    args = build_arg_parser().parse_args()
+    parser = build_arg_parser()
+    args = parser.parse_args()
 
     if args.merge:
         merge_parts(args.out_dir)
         return
+
+    # No language-specific defaults: the corpus and seed files always have to
+    # be given explicitly (see e.g. english/run_cluster_slurm.sh).
+    needed = ["noun_seeds_file", "verb_seeds_file"]
+    if not args.print_num_seed_steps:
+        needed.insert(0, "corpus_file")
+    missing = ["--" + n.replace("_", "-") for n in needed if getattr(args, n) is None]
+    if missing:
+        parser.error("the following arguments are required: " + ", ".join(missing))
 
     if args.print_num_seed_steps:
         # Seed-set sequence length doesn't depend on the corpus split at all

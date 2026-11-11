@@ -110,6 +110,12 @@
 #                     verb_inclusion.xlsx's Include judgments). Requires
 #                     network access the first time, to fetch nltk's wordnet
 #                     data and the `wn` package's omw-en:1.4 lexicon.
+#
+# EXCLUDE_NOUNS_FILE  Manual proper-noun blocklist passed to
+#                     from_tagged_corpus_to_seeds.py as --exclude-nouns-file
+#                     when seeds are regenerated (see REGENERATE_SEEDS).
+#                     Default: extra_proper_nouns.txt in this directory. Set to
+#                     an empty string to regenerate without a blocklist.
 
 set -euo pipefail
 
@@ -128,6 +134,15 @@ JOBS="${3:-$DEFAULT_JOBS}"
 CORPUS_SIZE="${4:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 REGENERATE_SEEDS="${REGENERATE_SEEDS:-1}"
+EXCLUDE_NOUNS_FILE="${EXCLUDE_NOUNS_FILE-$SCRIPT_DIR/extra_proper_nouns.txt}"
+SEEDS_ARGS=()
+if [[ "$REGENERATE_SEEDS" == "1" && -n "$EXCLUDE_NOUNS_FILE" ]]; then
+    if [[ ! -f "$EXCLUDE_NOUNS_FILE" ]]; then
+        echo "EXCLUDE_NOUNS_FILE not found: $EXCLUDE_NOUNS_FILE" >&2
+        exit 1
+    fi
+    SEEDS_ARGS=(--exclude-nouns-file "$EXCLUDE_NOUNS_FILE")
+fi
 
 CORPUS_SIZE_ARGS=""
 if [[ -n "$CORPUS_SIZE" ]]; then
@@ -136,7 +151,7 @@ fi
 
 if [[ "$REGENERATE_SEEDS" == "1" ]]; then
     echo "Regenerating postprocessed corpus and seed files (from_tagged_corpus_to_seeds.py)..."
-    (cd "$SCRIPT_DIR" && python3 "$SEEDS_SCRIPT")
+    (cd "$SCRIPT_DIR" && python3 "$SEEDS_SCRIPT" ${SEEDS_ARGS[@]+"${SEEDS_ARGS[@]}"})
     echo "Refreshing noun_selection.xlsx/verb_selection.xlsx from the regenerated .csv files..."
     python3 -c "
 import pandas as pd

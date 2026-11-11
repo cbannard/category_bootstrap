@@ -3,8 +3,9 @@
 
 Converted from ChildesDataPrep_Eng.ipynb. Steps:
 
-1. (optional, --download) fetch ManchesterCorpus.zip from Google Drive with
-   gdown and unzip it.
+1. (optional, --download) fetch ManchesterCorpus.zip (by default from Google
+   Drive, or from any URL given with --download-url) and unzip it. Uses only
+   the Python standard library - no gdown/wget needed.
 2. Walk the corpus directory, join CHAT lines that were wrapped across several
    physical lines (writing a ``.rem`` copy next to each ``.cha``/``.cex`` file),
    and extract adult/caregiver utterances, cleaned of CHAT markup.
@@ -16,6 +17,7 @@ Converted from ChildesDataPrep_Eng.ipynb. Steps:
 
 Usage:
     python3 childes_data_prep_eng.py --download
+    python3 childes_data_prep_eng.py --download --download-url https://example.org/ManchesterCorpus.zip
     python3 childes_data_prep_eng.py --corpus-dir Manchester/ --output manchester_input_tagged_trf_word_and_lemma.txt
     python3 childes_data_prep_eng.py --report-odd-chars --no-tag   # just inspect the cleaned text
 """
@@ -24,7 +26,8 @@ import argparse
 import copy
 import os
 import re
-import subprocess
+import shutil
+import urllib.request
 import sys
 import zipfile
 from collections import defaultdict
@@ -32,6 +35,12 @@ from collections import defaultdict
 # Google Drive file ID of ManchesterCorpus.zip.
 MANCHESTER_ZIP_GDRIVE_ID = "1YmiXKfAks2KnuSfRNpgfVnvnWBcsFsQy"
 MANCHESTER_ZIP_NAME = "ManchesterCorpus.zip"
+# Direct-download form of the Google Drive link. confirm=t skips the
+# "can't scan this file for viruses" page Drive shows for large files.
+DEFAULT_DOWNLOAD_URL = (
+    "https://drive.usercontent.google.com/download"
+    f"?id={MANCHESTER_ZIP_GDRIVE_ID}&export=download&confirm=t"
+)
 
 # Speaker tiers kept from the transcripts (adults/caregivers, not the target child).
 SPEAKER_RE = r"\*(ADU|BRO|DAD|FAT|FRI|GRA|INV|JUI|MOT|NIC|RAC|WAY)\:"
@@ -208,10 +217,18 @@ def deal_with_special_characters(textline):
     return outline
 
 
-def download_corpus(dest_dir="."):
-    """Fetch ManchesterCorpus.zip from Google Drive (needs `pip install gdown`) and unzip it."""
+def download_corpus(dest_dir=".", url=DEFAULT_DOWNLOAD_URL):
+    """Download the corpus zip from `url` into dest_dir and unzip it there."""
     zip_path = os.path.join(dest_dir, MANCHESTER_ZIP_NAME)
-    subprocess.run(["gdown", MANCHESTER_ZIP_GDRIVE_ID, "-O", zip_path], check=True)
+    print(f"Downloading {url} -> {zip_path}")
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(request) as response, open(zip_path, "wb") as out:
+        shutil.copyfileobj(response, out)
+    if not zipfile.is_zipfile(zip_path):
+        # Typically an HTML page instead of the file: a sharing/permission
+        # page, a sign-in page, or a link that isn't a direct download.
+        sys.exit(f"Downloaded file {zip_path} is not a zip archive - check that "
+                 f"the URL is a direct download link (got it from {url}).")
     with zipfile.ZipFile(zip_path) as zf:
         zf.extractall(dest_dir)
 
@@ -254,7 +271,11 @@ def main():
     parser.add_argument("--no-lemma", action="store_true",
                         help="write word_POS tokens (the notebook's original format) instead of word_lemma_POS")
     parser.add_argument("--download", action="store_true",
-                        help=f"download and unzip {MANCHESTER_ZIP_NAME} from Google Drive first (requires gdown)")
+                        help=f"download and unzip {MANCHESTER_ZIP_NAME} first (from Google Drive "
+                             "unless --download-url is given)")
+    parser.add_argument("--download-url", default=DEFAULT_DOWNLOAD_URL,
+                        help="direct-download URL of the corpus zip, used with --download "
+                             "(default: the project's Google Drive copy)")
     parser.add_argument("--report-odd-chars", action="store_true",
                         help="print cleaned utterances that still contain unexpected characters")
     parser.add_argument("--no-tag", action="store_true",
@@ -269,7 +290,7 @@ def main():
                        else "manchester_input_tagged_trf_word_and_lemma.txt")
 
     if args.download:
-        download_corpus(os.path.dirname(os.path.normpath(args.corpus_dir)) or ".")
+        download_corpus(os.path.dirname(os.path.normpath(args.corpus_dir)) or ".", args.download_url)
 
     corpus_dir = args.corpus_dir if args.corpus_dir.endswith("/") else args.corpus_dir + "/"
     if not os.path.isdir(corpus_dir):

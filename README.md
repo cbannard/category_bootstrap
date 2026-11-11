@@ -24,7 +24,7 @@ All of these live in `english/`.
 
 Builds a POS-tagged English corpus from the raw Manchester CHILDES transcripts (converted from the former `ChildesDataPrep_Eng.ipynb`). It:
 
-1. optionally downloads `ManchesterCorpus.zip` from Google Drive (`--download`, needs `gdown`) and unzips it to `Manchester/`;
+1. optionally downloads `ManchesterCorpus.zip` (`--download`; from the project's Google Drive copy by default, or from any direct-download URL given with `--download-url`) and unzips it to `Manchester/`. This uses only the Python standard library, so no `gdown`/`wget` is needed;
 2. walks every child's subdirectory, joins CHAT lines that were wrapped over several physical lines (writing a `.rem` copy next to each `.cha`/`.cex` file), and keeps only adult/caregiver utterances (`*MOT`, `*FAT`, `*DAD`, `*INV`, etc. — not the target child), dropping lines with unintelligible `xxx`/`www` material and stripping CHAT markup (replacement forms `[: ...]`, retracing/error codes, `&`-fillers like `&-um`, `@` form markers, `0`-omissions, and so on);
 3. tags and lemmatizes each utterance with spaCy `en_core_web_trf` and writes one utterance per line as space-separated `word_lemma_POS` tokens, i.e. `manchester_input_tagged_trf_word_and_lemma.txt`, the input to step 1. `--no-lemma` writes the notebook's original `word_POS` format instead.
 
@@ -41,6 +41,7 @@ python3 childes_data_prep_eng.py --no-tag --report-odd-chars          # just che
 | `--output` | `manchester_input_tagged_trf_word_and_lemma.txt` (`manchester_input_tagged_trf.txt` with `--no-lemma`) | tagged output file (overwritten, not appended to) |
 | `--no-lemma` | off | write `word_POS` tokens instead of `word_lemma_POS` |
 | `--download` | off | download and unzip `ManchesterCorpus.zip` first |
+| `--download-url` | Google Drive copy | direct-download URL of the corpus zip, used with `--download` |
 | `--report-odd-chars` | off | print cleaned utterances still containing characters outside the expected set |
 | `--no-tag` | off | skip the spaCy tagging step |
 | `--spacy-model` | `en_core_web_trf` | spaCy model to use (`python -m spacy download en_core_web_trf`) |
@@ -208,9 +209,9 @@ Python 3 with `pandas`, `numpy`, `scipy`, `openpyxl`, `nltk`, `wn` (WordNet). In
 pip install pandas numpy scipy openpyxl nltk wn
 ```
 
-Corpus preparation (`childes_data_prep_eng.py`) additionally needs `spacy` with the `en_core_web_trf` model, plus `gdown` if using `--download`:
+Corpus preparation (`childes_data_prep_eng.py`) additionally needs `spacy` with the `en_core_web_trf` model:
 
 ```
-pip install spacy gdown
+pip install spacy
 python -m spacy download en_core_web_trf
 ```

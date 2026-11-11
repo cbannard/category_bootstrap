@@ -11,6 +11,31 @@ Code for bootstrapping words into grammatical categories (NOUN/VERB) from a tagg
 
 ## Pipeline
 
+### 0. `childes_data_prep_eng.py` — corpus preparation and tagging
+
+Builds a POS-tagged English corpus from the raw Manchester CHILDES transcripts (converted from the former `ChildesDataPrep_Eng.ipynb`). It:
+
+1. optionally downloads `ManchesterCorpus.zip` from Google Drive (`--download`, needs `gdown`) and unzips it to `Manchester/`;
+2. walks every child's subdirectory, joins CHAT lines that were wrapped over several physical lines (writing a `.rem` copy next to each `.cha`/`.cex` file), and keeps only adult/caregiver utterances (`*MOT`, `*FAT`, `*DAD`, `*INV`, etc. — not the target child), dropping lines with unintelligible `xxx`/`www` material and stripping CHAT markup (replacement forms `[: ...]`, retracing/error codes, `&`-fillers like `&-um`, `@` form markers, `0`-omissions, and so on);
+3. tags each utterance with spaCy `en_core_web_trf` and writes one utterance per line as space-separated `word_POS` tokens.
+
+```
+python3 childes_data_prep_eng.py --download                           # fetch the corpus, then clean and tag it
+python3 childes_data_prep_eng.py --corpus-dir Manchester/ --output manchester_input_tagged_trf.txt
+python3 childes_data_prep_eng.py --no-tag --report-odd-chars          # just check the cleanup for leftover markup
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--corpus-dir` | `Manchester/` | directory with one subdirectory per child |
+| `--output` | `manchester_input_tagged_trf.txt` | tagged output file (overwritten, not appended to) |
+| `--download` | off | download and unzip `ManchesterCorpus.zip` first |
+| `--report-odd-chars` | off | print cleaned utterances still containing characters outside the expected set |
+| `--no-tag` | off | skip the spaCy tagging step |
+| `--spacy-model` | `en_core_web_trf` | spaCy model to use (`python -m spacy download en_core_web_trf`) |
+
+Note that the output is in `word_POS` format, whereas `from_tagged_corpus_to_seeds.py` below reads `manchester_input_tagged_trf_word_and_lemma.txt`, in `WORD_LEMMA_TAG` format — so this script doesn't yet produce that file directly.
+
 ### 1. `from_tagged_corpus_to_seeds.py`
 
 Reads the raw corpus, applies tag/token cleanup rules, writes the postprocessed corpus file, then builds the noun and verb seed selection files (`noun_selection.xlsx`/`.csv`, `verb_selection.xlsx`/`.csv`). Run this first, and whenever the raw corpus or `verb_inclusion.xlsx` changes.
@@ -150,7 +175,7 @@ This script was written and syntax-checked without access to a real SLURM schedu
 
 ## Notebooks
 
-- `ChildesDataPrep_Eng.ipynb` / `ChildesDataPrep_JP.ipynb` — corpus preparation for the English/Japanese CHILDES data.
+- `ChildesDataPrep_JP.ipynb` — corpus preparation for the Japanese CHILDES data (the English equivalent is now `childes_data_prep_eng.py`, see Pipeline step 0).
 - `postTaggingProcessing.ipynb` — exploratory post-tagging processing.
 - `GlobalWordnet.ipynb` — WordNet exploration used in seed selection.
 
@@ -160,4 +185,11 @@ Python 3 with `pandas`, `numpy`, `scipy`, `openpyxl`, `nltk`, `wn` (WordNet). In
 
 ```
 pip install pandas numpy scipy openpyxl nltk wn
+```
+
+Corpus preparation (`childes_data_prep_eng.py`) additionally needs `spacy` with the `en_core_web_trf` model, plus `gdown` if using `--download`:
+
+```
+pip install spacy gdown
+python -m spacy download en_core_web_trf
 ```

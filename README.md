@@ -174,9 +174,14 @@ This script was written and syntax-checked without access to a real SLURM schedu
 
 ## Notebooks
 
-- `ChildesDataPrep_JP.ipynb` — corpus preparation for the Japanese CHILDES data (the English equivalent is now `childes_data_prep_eng.py`, see Pipeline step 0).
-- `postTaggingProcessing.ipynb` — exploratory post-tagging processing.
+The Jupyter notebooks (`ChildesDataPrep_Eng.ipynb`, `ChildesDataPrep_JP.ipynb`, `postTaggingProcessing.ipynb`, `GlobalWordnet.ipynb`) are not part of the pipeline and are kept on the [`notebooks`](https://github.com/cbannard/category_bootstrap/tree/notebooks) branch:
+
+- `ChildesDataPrep_Eng.ipynb` — original English corpus preparation, now replaced by `childes_data_prep_eng.py` (Pipeline step 0).
+- `ChildesDataPrep_JP.ipynb` — corpus preparation for the Japanese CHILDES data.
+- `postTaggingProcessing.ipynb` — early exploratory version of the tag cleanup now done in `from_tagged_corpus_to_seeds.py`.
 - `GlobalWordnet.ipynb` — WordNet exploration used in seed selection.
+
+To get them: `git checkout notebooks -- '*.ipynb'` (or switch to the branch).
 
 ## Requirements
 

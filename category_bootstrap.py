@@ -903,7 +903,7 @@ def compute_seed_tag_guess_probs(corpus, seeds, corpus_words=None, corpus_tags=N
     _is_word_token). Both required and must be the same length.
 
     corpus_tags: the corpus's own per-occurrence POS tags (spaCy-derived -
-    see ChildesDataPrep_Eng.ipynb/ChildesDataPrep_JP.ipynb), required.
+    see childes_data_prep_eng.py), required.
 
     require_tag_match mirrors the run's own noun/verb criterion (same flag
     passed to extract_context_patterns_fast/categorize_with_contexts_fast

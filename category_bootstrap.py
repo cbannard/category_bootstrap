@@ -2580,8 +2580,8 @@ def build_arg_parser():
         help="Run ONLY this fold (0-indexed) of the --n-folds cross-validation, "
              "instead of every fold in turn. Single-job mode only (needs --mode). "
              "The split is identical to the one the full run would use for that "
-             "fold. Used by run_cluster_slurm.sh FOLD_JOBS=1 to run each fold as "
-             "its own SLURM task; --merge then adds the across-fold mean rows.",
+             "fold, so each fold can be run as its own job; --merge then adds "
+             "the across-fold mean rows.",
     )
     parser.add_argument(
         "--test-fraction", type=float, default=0.2,

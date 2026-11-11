@@ -8,12 +8,15 @@ Converted from ChildesDataPrep_Eng.ipynb. Steps:
 2. Walk the corpus directory, join CHAT lines that were wrapped across several
    physical lines (writing a ``.rem`` copy next to each ``.cha``/``.cex`` file),
    and extract adult/caregiver utterances, cleaned of CHAT markup.
-3. Tag every utterance with spaCy's ``en_core_web_trf`` model and write one
-   utterance per line as space-separated ``word_POS`` tokens.
+3. Tag and lemmatize every utterance with spaCy's ``en_core_web_trf`` model and
+   write one utterance per line as space-separated ``word_lemma_POS`` tokens -
+   the ``manchester_input_tagged_trf_word_and_lemma.txt`` file that
+   from_tagged_corpus_to_seeds.py reads. ``--no-lemma`` gives the old
+   ``word_POS`` format instead.
 
 Usage:
     python3 childes_data_prep_eng.py --download
-    python3 childes_data_prep_eng.py --corpus-dir Manchester/ --output manchester_input_tagged_trf.txt
+    python3 childes_data_prep_eng.py --corpus-dir Manchester/ --output manchester_input_tagged_trf_word_and_lemma.txt
     python3 childes_data_prep_eng.py --report-odd-chars --no-tag   # just inspect the cleaned text
 """
 
@@ -221,8 +224,11 @@ def report_odd_characters(all_input):
                 print(i)
 
 
-def tag_utterances(all_input, output_file, model="en_core_web_trf"):
-    """POS-tag each utterance with spaCy and write one `word_POS ...` line per utterance."""
+def tag_utterances(all_input, output_file, model="en_core_web_trf", with_lemma=True):
+    """POS-tag each utterance with spaCy and write one line per utterance.
+
+    Tokens are written as `word_lemma_POS` (or `word_POS` if with_lemma is False).
+    """
     import spacy  # imported here so the other steps don't need spaCy installed
 
     nlp = spacy.load(model)
@@ -230,15 +236,23 @@ def tag_utterances(all_input, output_file, model="en_core_web_trf"):
         for j in range(len(all_input)):
             for utt in all_input[j]:
                 doc = nlp(str(utt))
-                fi.write(" ".join([w.text + "_" + w.pos_ for w in doc]) + "\n")
+                if with_lemma:
+                    tokens = [w.text + "_" + w.lemma_ + "_" + w.pos_ for w in doc]
+                else:
+                    tokens = [w.text + "_" + w.pos_ for w in doc]
+                fi.write(" ".join(tokens) + "\n")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--corpus-dir", default="Manchester/",
                         help="directory containing one subdirectory per child corpus (default: Manchester/)")
-    parser.add_argument("--output", default="manchester_input_tagged_trf.txt",
-                        help="tagged output file, overwritten if it exists (default: manchester_input_tagged_trf.txt)")
+    parser.add_argument("--output", default=None,
+                        help="tagged output file, overwritten if it exists (default: "
+                             "manchester_input_tagged_trf_word_and_lemma.txt, or "
+                             "manchester_input_tagged_trf.txt with --no-lemma)")
+    parser.add_argument("--no-lemma", action="store_true",
+                        help="write word_POS tokens (the notebook's original format) instead of word_lemma_POS")
     parser.add_argument("--download", action="store_true",
                         help=f"download and unzip {MANCHESTER_ZIP_NAME} from Google Drive first (requires gdown)")
     parser.add_argument("--report-odd-chars", action="store_true",
@@ -249,6 +263,10 @@ def main():
                         help="spaCy model to tag with (default: en_core_web_trf; "
                              "install with `python -m spacy download en_core_web_trf`)")
     args = parser.parse_args()
+
+    if args.output is None:
+        args.output = ("manchester_input_tagged_trf.txt" if args.no_lemma
+                       else "manchester_input_tagged_trf_word_and_lemma.txt")
 
     if args.download:
         download_corpus(os.path.dirname(os.path.normpath(args.corpus_dir)) or ".")
@@ -264,7 +282,7 @@ def main():
         report_odd_characters(all_input)
 
     if not args.no_tag:
-        tag_utterances(all_input, args.output, args.spacy_model)
+        tag_utterances(all_input, args.output, args.spacy_model, with_lemma=not args.no_lemma)
         print(f"Wrote {args.output}")
 
 

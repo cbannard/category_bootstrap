@@ -17,24 +17,23 @@ Builds a POS-tagged English corpus from the raw Manchester CHILDES transcripts (
 
 1. optionally downloads `ManchesterCorpus.zip` from Google Drive (`--download`, needs `gdown`) and unzips it to `Manchester/`;
 2. walks every child's subdirectory, joins CHAT lines that were wrapped over several physical lines (writing a `.rem` copy next to each `.cha`/`.cex` file), and keeps only adult/caregiver utterances (`*MOT`, `*FAT`, `*DAD`, `*INV`, etc. — not the target child), dropping lines with unintelligible `xxx`/`www` material and stripping CHAT markup (replacement forms `[: ...]`, retracing/error codes, `&`-fillers like `&-um`, `@` form markers, `0`-omissions, and so on);
-3. tags each utterance with spaCy `en_core_web_trf` and writes one utterance per line as space-separated `word_POS` tokens.
+3. tags and lemmatizes each utterance with spaCy `en_core_web_trf` and writes one utterance per line as space-separated `word_lemma_POS` tokens, i.e. `manchester_input_tagged_trf_word_and_lemma.txt`, the input to step 1. `--no-lemma` writes the notebook's original `word_POS` format instead.
 
 ```
 python3 childes_data_prep_eng.py --download                           # fetch the corpus, then clean and tag it
-python3 childes_data_prep_eng.py --corpus-dir Manchester/ --output manchester_input_tagged_trf.txt
+python3 childes_data_prep_eng.py --corpus-dir Manchester/ --output manchester_input_tagged_trf_word_and_lemma.txt
 python3 childes_data_prep_eng.py --no-tag --report-odd-chars          # just check the cleanup for leftover markup
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--corpus-dir` | `Manchester/` | directory with one subdirectory per child |
-| `--output` | `manchester_input_tagged_trf.txt` | tagged output file (overwritten, not appended to) |
+| `--output` | `manchester_input_tagged_trf_word_and_lemma.txt` (`manchester_input_tagged_trf.txt` with `--no-lemma`) | tagged output file (overwritten, not appended to) |
+| `--no-lemma` | off | write `word_POS` tokens instead of `word_lemma_POS` |
 | `--download` | off | download and unzip `ManchesterCorpus.zip` first |
 | `--report-odd-chars` | off | print cleaned utterances still containing characters outside the expected set |
 | `--no-tag` | off | skip the spaCy tagging step |
 | `--spacy-model` | `en_core_web_trf` | spaCy model to use (`python -m spacy download en_core_web_trf`) |
-
-Note that the output is in `word_POS` format, whereas `from_tagged_corpus_to_seeds.py` below reads `manchester_input_tagged_trf_word_and_lemma.txt`, in `WORD_LEMMA_TAG` format — so this script doesn't yet produce that file directly.
 
 ### 1. `from_tagged_corpus_to_seeds.py`
 
